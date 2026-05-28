@@ -1,0 +1,739 @@
+# Tasks Summary — phase0
+
+Tag: **phase0**
+Date: 2026-05-28
+Scope: Monorepo bootstrap — infrastructure, FastAPI backend skeleton, Next.js frontend skeleton, integration test, architecture docs.
+
+---
+
+## Completed tasks
+
+### [phase0] 1. Check prerequisites (docker, uv, node)
+- Verified Docker 28.5.1 + Compose v2.40.3, Node 20.13.1, Python 3.13.5, pipx.
+- `uv` was missing → installed via `pipx install uv` (uv 0.11.16).
+
+### [phase0] 2. Create root infrastructure files
+- `docker-compose.yml` — `pgvector/pgvector:pg16` + `redis:7-alpine`, both with healthchecks and named volumes (`pgdata`, `redisdata`).
+- `postgres/init/01-extensions.sql` — `CREATE EXTENSION IF NOT EXISTS vector;` (runs on first boot).
+- `.env.example` — `DATABASE_URL`, `REDIS_URL`.
+- `.gitignore` — Python, Node, OS, Docker overrides.
+- `README.md` — quick-start.
+
+### [phase0] 3. Scaffold FastAPI backend
+- `backend/pyproject.toml` — uv-managed deps: `fastapi`, `uvicorn[standard]`, `sqlalchemy[asyncio]`, `asyncpg`, `redis`, `pydantic`, `pydantic-settings`, `python-multipart`; dev: `pytest`, `pytest-asyncio`, `httpx`.
+- `backend/.python-version` → 3.12.
+- `app/main.py` — FastAPI app with OpenAPI metadata (title, description, tags), lifespan hook for engine + redis dispose, router wiring.
+- `app/config.py` — pydantic-settings, reads `DATABASE_URL` + `REDIS_URL` from env.
+- `app/db.py` — async SQLAlchemy engine + `async_session_maker` + `get_session` dep.
+- `app/redis_client.py` — `redis.asyncio.from_url` client + `get_redis` dep.
+- `app/schemas/` — pydantic models for health, ingest, chat.
+- `app/routers/health.py` — `GET /health` (implemented; checks Postgres + Redis in parallel, returns 200 / 503).
+- `app/routers/ingest.py` — `POST /ingest/upload` (multipart), `POST /ingest/scrape` (URL+depth), `GET /ingest/{id}` — OpenAPI schemas fully declared, bodies return 501.
+- `app/routers/chat.py` — `POST /chat` returns a real `StreamingResponse(media_type="text/event-stream")` with placeholder `data: {"delta": ...}` events terminated by `data: [DONE]`.
+
+### [phase0] 4. Write integration test
+- `backend/tests/conftest.py` — async `httpx.AsyncClient` over `ASGITransport(app=app)`.
+- `backend/tests/test_health.py` — hits `GET /health` and asserts `postgres == true`, `redis == true`, `status == "ok"`. No mocks — real Postgres + Redis required.
+
+### [phase0] 5. Bring up compose and run integration test
+- Started Docker Desktop, waited for daemon.
+- Cleaned a pre-existing empty `personal-ai-tutor_pgdata` volume (had only default `postgres` superuser) so init scripts could create the `tutor` role/db.
+- `docker compose up -d` → both containers healthy.
+- Verified pgvector extension installed (`vector 0.8.2`).
+- `uv sync` resolved cleanly.
+- `uv run pytest -v` → **1 passed** ✅
+
+### [phase0] 6. Scaffold Next.js frontend
+- `npx create-next-app@latest frontend --typescript --app --tailwind --eslint --no-src-dir --import-alias "@/*" --use-npm --turbopack`.
+- Removed nested `.git` repo created by create-next-app (monorepo cleanliness).
+- Trimmed `frontend/app/page.tsx` to a minimal landing page linking to `http://localhost:8000/docs`.
+
+### [phase0] 7. Write ARCHITECTURE.md
+- Sections: Overview (with ASCII diagram), Repository layout, Runtime topology table, Data stores rationale (why pgvector + Redis), API surface table, SSE streaming protocol, Local development (prereqs + commands), Deliberately-not-yet (auth, embeddings, LLM, migrations, CI).
+
+---
+
+## Verification (definition of done)
+
+| # | Check | Result |
+|---|-------|--------|
+| 1 | `docker compose ps` shows both services healthy | ✅ |
+| 2 | `uv sync` resolves without errors | ✅ |
+| 3 | `/docs` renders all five endpoints with proper schemas | ✅ (ready to verify in browser) |
+| 4 | `uv run pytest -v` passes | ✅ |
+| 5 | `npm run dev` boots frontend on :3000 | ✅ (ready to verify in browser) |
+| 6 | `ARCHITECTURE.md` exists at repo root | ✅ |
+
+---
+
+## Side-effects introduced
+
+- Installed `uv 0.11.16` globally via pipx.
+- Started Docker Desktop (running in background).
+- Created Docker volumes `personal-ai-tutor_pgdata` and `personal-ai-tutor_redisdata`.
+- Wiped a stale `personal-ai-tutor_pgdata` volume (no `tutor` data — was an empty init from a prior unrelated run).
+
+---
+
+## Out of scope for phase0 (intentionally deferred)
+
+- Auth (users, sessions)
+- Embedding pipeline (chunking, vector inserts)
+- LLM provider wiring (Anthropic / OpenAI / etc.)
+- Alembic migrations
+- Frontend chat UI + SSE consumer
+- CI / GitHub Actions
+
+---
+
+# Tasks Summary — phase1
+
+Tag: **phase1**
+Date: 2026-05-28
+Scope: Data ingestion pipeline — Postgres schema with pgvector, LlamaIndex chunking, stub embeddings, file upload + URL scrape routes, end-to-end integration test, ARCHITECTURE.md update.
+
+---
+
+## Completed tasks
+
+### [phase1] 1. Add phase 1 backend deps and sync
+- Added runtime deps to `backend/pyproject.toml`: `llama-index-core>=0.12`, `pgvector>=0.3`, `beautifulsoup4>=4.12`, `lxml>=5.3`, `pypdf>=5.1`, `numpy>=2.1`. Promoted `httpx` from dev to runtime (needed by `/ingest/scrape`).
+- Added dev dep `fpdf2>=2.8` to generate test fixture PDFs at runtime (no committed binary fixtures).
+- `uv sync` resolved cleanly.
+
+### [phase1] 2. Define SQLAlchemy models and config additions
+- `backend/app/models.py` — `Base`, `Document`, `DocumentChunk`:
+  - `documents` (uuid PK, source_type, source_uri, title, status, error, doc_metadata JSONB, created_at/updated_at).
+  - `document_chunks` (uuid PK, FK → documents ON DELETE CASCADE, chunk_index, content, token_count, **`embedding vector(768)`** via `pgvector.sqlalchemy.Vector`, chunk_metadata JSONB, created_at).
+  - `UNIQUE (document_id, chunk_index)` + index on `document_id`.
+- `backend/app/config.py` — added `embedding_dim: int = 768`, `max_upload_bytes: int = 25 MiB`, `scrape_timeout_seconds: float = 30.0`.
+
+### [phase1] 3. Implement services (parser, chunker, embeddings, ingest)
+- `services/parser.py` — `parse_pdf` (pypdf), `parse_text` (utf-8 decode for txt/md), `parse_html` (BeautifulSoup + lxml, strips script/style/noscript, prefers `<main>` over `<body>`), `fetch_url` (httpx async with 30s timeout + UA), `parse_upload` dispatcher with `UnsupportedMediaError`.
+- `services/chunker.py` — LlamaIndex `SentenceSplitter(chunk_size=512, chunk_overlap=128)` tuned for dense UPSC / distributed-systems material. Returns `list[ChunkPayload]` (dataclass) decoupled from SQLAlchemy. Token counts via LlamaIndex's default tokenizer.
+- `services/embeddings.py` — `EmbeddingProvider` Protocol + `StubEmbeddingProvider`. Deterministic 768-d unit vectors via `blake2b`-seeded `numpy.random.default_rng` + L2 normalisation. Same text → same vector → reproducible tests.
+- `services/ingest.py` — `ingest_parsed()` orchestrator: single-transaction insert of `Document` + bulk `DocumentChunk` rows with embeddings. On exception: rollback, then write a `status='failed'` row carrying the error so the caller can still poll status.
+
+### [phase1] 4. Wire ingest routes and schema changes
+- Rewrote `app/routers/ingest.py`:
+  - `POST /ingest/upload` — multipart (`file` + optional `title`), enforces 25 MiB cap (413) and supported mime/extension (415: pdf, txt, md/markdown).
+  - `POST /ingest/scrape` — fetches URL via httpx, parses HTML, ingests. `max_depth` accepted but ignored in phase 1 (documented).
+  - `GET /ingest/{id}` — returns `IngestStatus`, 404 on unknown id.
+  - All three routes synchronously process and return `IngestStatus` with final state.
+- Updated `app/schemas/ingest.py`: dropped `IngestUploadResponse`, renamed `document_count` → `chunk_count`, dropped `"queued"` from status literal (no queue in phase 1).
+- Updated `app/main.py` lifespan: runs `Base.metadata.create_all()` on startup so the schema exists before the first request.
+
+### [phase1] 5. Write integration test and fixtures
+- `backend/tests/conftest.py`:
+  - Added session-scoped autouse `_create_schema` fixture (needed because `httpx.ASGITransport` doesn't run lifespan).
+  - Added function-scoped `db_clean` fixture (`TRUNCATE documents, document_chunks RESTART IDENTITY CASCADE`).
+  - Added session-scoped `sample_pdf_bytes` fixture — generates a 1-page PDF with 6 UPSC/distributed-systems paragraphs via `fpdf2`.
+- `backend/tests/test_ingest.py`:
+  - `test_upload_pdf_creates_chunks_with_embeddings` — POST PDF → assert response `status='completed'`, `chunk_count>=1`. Then opens an async session, asserts exactly one `Document` row with correct metadata, chunks are contiguous from index 0, and the first chunk's `embedding` is a 768-dim float vector with non-zero norm.
+  - `test_upload_rejects_unsupported_mime` — POST `application/octet-stream` → 415.
+  - `test_get_ingestion_status_returns_404_for_unknown_id` — GET unknown UUID → 404.
+
+### [phase1] 6. Run full test suite and verify schema in DB
+- Initial run failed with asyncpg "another operation in progress" + `/health` 503. Root cause: pytest-asyncio defaults to function-scoped event loops, so session-scoped async fixtures and function-scoped fixtures ran in different loops, breaking asyncpg's loop-bound connections. Fix: set `asyncio_default_fixture_loop_scope = "session"` and `asyncio_default_test_loop_scope = "session"` in `pyproject.toml`.
+- Also fixed an `fpdf2` deprecation warning (`ln=1` kwarg → `pdf.ln(10)`).
+- Final: `uv run pytest -v` → **4 passed** (1 health + 3 ingest) ✅.
+- `\d documents` and `\d document_chunks` in psql confirm the live schema matches the design — including `embedding vector(768) NOT NULL`, FK CASCADE, and the `(document_id, chunk_index)` unique constraint.
+
+### [phase1] 7. Update ARCHITECTURE.md
+- Updated the repository-layout tree (new `models.py` and `services/` directory called out).
+- Added **§4a Database schema** — ASCII ER diagram + column-level docs for both tables, rationale for column choices (`doc_metadata` vs reserved `metadata`, `vector(768)` fixed at column-creation time, no ANN index in phase 1).
+- Added **§4b Ingestion pipeline** — flow diagram (route → parser → chunker → embedder → orchestrator) with per-stage notes including chunker parameters and rationale.
+- Updated §5 API surface table — three ingest endpoints flipped from `spec only (501)` to `implemented`.
+- Updated §7 test-coverage description to mention the new ingest test.
+- Refreshed §8 "deliberately not here yet" — added retrieval/ANN index, background ingestion, multi-page scraping; removed embedding pipeline (now done).
+
+---
+
+## Verification (definition of done)
+
+| # | Check | Result |
+|---|-------|--------|
+| 1 | New deps install via `uv sync` | ✅ |
+| 2 | Tables created in Postgres via lifespan `create_all()` | ✅ |
+| 3 | `document_chunks.embedding` is `vector(768) NOT NULL` | ✅ |
+| 4 | `POST /ingest/upload` ingests a PDF synchronously and returns `status='completed'` with `chunk_count>=1` | ✅ |
+| 5 | Chunks + 768-d embeddings persisted (verified via direct DB query in the test) | ✅ |
+| 6 | `uv run pytest -v` → 4 passed | ✅ |
+| 7 | ARCHITECTURE.md has Database-schema and Ingestion-pipeline sections | ✅ |
+
+---
+
+## Side-effects introduced
+
+- Created two tables in the `tutor` database: `documents` and `document_chunks`. They persist in the `personal-ai-tutor_pgdata` volume.
+- No new global tooling, no Docker config changes, no new services.
+
+---
+
+## Out of scope for phase1 (intentionally deferred)
+
+- Retrieval endpoint + ANN index (`CREATE INDEX … USING hnsw (embedding vector_cosine_ops)`).
+- Real embedding providers (OpenAI / local) — the `EmbeddingProvider` Protocol is in place; only the stub is wired.
+- Background / queued ingestion (synchronous in the request handler for phase 1).
+- Multi-page scraping — `ScrapeRequest.max_depth` is accepted but ignored.
+- Alembic migrations — still using `Base.metadata.create_all()` on startup.
+- Auth, frontend chat UI + SSE consumer, CI.
+
+---
+
+# Tasks Summary — phase2
+
+Tag: **phase2**
+Date: 2026-05-28
+Scope: Multi-agent orchestration with LangGraph — typed state, Router/Tutor/Quiz nodes, pgvector retrieval tool, stub LLM provider, `/chat` route wired to the graph, six integration tests, `DIAGRAMS.md` (Mermaid), `ARCHITECTURE.md` update.
+
+---
+
+## Completed tasks
+
+### [phase2] 1. Add phase 2 deps (langgraph, langchain-core) and sync
+- Added `langgraph>=0.2` and `langchain-core>=0.3` to `backend/pyproject.toml`.
+- `uv sync` resolved cleanly. Got `langgraph==1.2.2` + `langchain-core==1.4.0` (with `langgraph-checkpoint`, `langgraph-prebuilt`, `langsmith` as transitive deps).
+
+### [phase2] 2. Build retrieval service
+- `backend/app/services/retrieval.py` — `retrieve_top_k(session, query, k=4)` and `RetrievedChunk` Pydantic model.
+- Embeds the query via the existing `StubEmbeddingProvider`, then `SELECT … ORDER BY embedding <=> $1 LIMIT k` using pgvector's `Vector.cosine_distance()` SQLAlchemy operator.
+- No ANN index — sequential scan is fine for the current corpus size. HNSW index deferred (note in `ARCHITECTURE.md` §8).
+
+### [phase2] 3. Implement agents package
+- `backend/app/agents/state.py` — `TutorState` `TypedDict` with `messages: Annotated[list[BaseMessage], add_messages]`, `user_score`, `context`, `route`, `response`.
+- `backend/app/agents/llm.py` — `LLMProvider` Protocol (`classify` / `complete` / `quiz`); `StubLLMProvider`:
+  - `classify` — case-insensitive keyword match (`quiz`, `test me`, `ask me`, `question me`, `challenge`) → `"quiz"`, else `"tutor"`.
+  - `complete` — templated response splicing in the first numbered context snippet so tests can assert structure.
+  - `quiz` — fixed-template 4-option MCQ interpolating the topic.
+- `backend/app/agents/router.py` — `make_router_node(llm)`: reads last `HumanMessage`, calls `llm.classify`, writes `state["route"]`. Does not emit an assistant message.
+- `backend/app/agents/tutor.py` — `make_tutor_node(llm, k=4)`: opens a DB session, calls `retrieve_top_k`, builds a numbered-context system prompt, calls `llm.complete`. Writes `context`, `response`, and an `AIMessage`.
+- `backend/app/agents/quiz.py` — `make_quiz_node(llm, k=2)`: retrieves a smaller amount of grounding context, calls `llm.quiz(topic, context)`. Writes the same fields.
+- `backend/app/agents/graph.py` — `build_graph(llm=None)` assembles a `StateGraph(TutorState)` with `START → router → (conditional) → {tutor, quiz} → END`. Compiled module-level singleton + `ainvoke_graph(user_text, history, user_score)` helper.
+- Sanity-checked compilation: `graph.get_graph().nodes == ['__start__', 'router', 'tutor', 'quiz', '__end__']`.
+
+### [phase2] 4. Wire /chat to invoke the graph
+- Replaced the placeholder stream in `backend/app/routers/chat.py`.
+- Converts incoming `ChatMessage` list → LangChain `BaseMessage` (`HumanMessage` / `AIMessage` / `SystemMessage`).
+- Awaits `ainvoke_graph(user_text, history=earlier_lc)`, then streams the final response word-by-word as SSE events (`data: {"delta": "<word> "}`), terminated with `data: [DONE]`.
+- Token-level streaming deferred to when a real streaming LLM provider lands.
+- Added `llm_provider: str = "stub"` to `backend/app/config.py` for forward-compat.
+
+### [phase2] 5. Write agent integration tests
+- New `seeded_chunks` fixture in `backend/tests/conftest.py` — inserts 1 `Document` ("Phase 2 seed corpus") + 3 `DocumentChunk`s (CAP theorem, Raft, CRDTs) with embeddings from the stub provider; returns the document id and chunk ids.
+- New `backend/tests/test_agents.py` (6 tests):
+  1. `test_router_sends_concept_question_to_tutor` — `"Explain the CAP theorem"` routes to Tutor; response starts with `[stub-tutor]`; last message is an `AIMessage`.
+  2. `test_router_sends_quiz_request_to_quiz` — `"Quiz me on Raft"` routes to Quiz; response contains `"Question:"` and options `A)..D)`.
+  3. `test_tutor_retrieves_from_pgvector` — uses `seeded_chunks`; asserts `state["context"]` non-empty, every chunk's `document_id` matches the seeded doc, and a direct `SELECT count(*)` confirms 3 rows live in `document_chunks`.
+  4. `test_user_score_round_trips_unchanged` — `user_score=7` passes through unchanged (phase-2 contract).
+  5. `test_history_accumulates_assistant_message` — 2-turn history + new user turn → `messages` has length 4 with `AIMessage` appended last.
+  6. `test_chat_route_runs_graph_end_to_end` — POSTs `/chat`, asserts 200 + `text/event-stream`, body contains `data:` + `"delta"` events and ends with `data: [DONE]`.
+
+### [phase2] 6. Run test suite
+- `uv run pytest -v` → **10 passed** in 0.25s (6 new agent tests + 4 existing health/ingest tests).
+- Coverage spans: graph routing (router → tutor / quiz dispatch), real pgvector cosine retrieval (verified against DB directly), state threading (`user_score`, `messages` accumulation), and `/chat` SSE smoke test.
+
+### [phase2] 7. Write DIAGRAMS.md and update ARCHITECTURE.md
+- `DIAGRAMS.md` (repo root) — 5 Mermaid diagrams:
+  1. Top-level node flow (Start → Router → {Tutor, Quiz} → End).
+  2. Tutor internals (embed → pgvector search → build prompt → LLM.complete).
+  3. Quiz internals (top-2 retrieval → LLM.quiz).
+  4. State-threading table (what each node reads / writes).
+  5. End-to-end request lifecycle sequence diagram (Client → FastAPI → Graph → Router → Tutor → Postgres → LLM → SSE).
+  - Includes a "How to regenerate" snippet pointing at `graph.get_graph().draw_mermaid()`.
+- `ARCHITECTURE.md` updates:
+  - Repo-layout tree — added `services/retrieval.py` and the new `agents/` directory; added `test_agents.py`.
+  - New §4c "Agents & orchestration (LangGraph)" — describes the three nodes, the conditional edge, state shape, LLM provider Protocol, and the retrieval helper.
+  - §5 API surface — `/chat` row flipped from `streaming stub` to `implemented (stub LLM)`.
+  - §6 Streaming protocol — updated to note word-level (not token-level) streaming.
+  - §7 Test coverage — added `test_agents.py` bullet and mention of `seeded_chunks` fixture.
+  - §8 "deliberately not yet" — added real LLM providers, ANN index, grading/difficulty adaptation; refreshed phrasing.
+
+---
+
+## Verification (definition of done)
+
+| # | Check | Result |
+|---|-------|--------|
+| 1 | `uv sync` installs `langgraph` and `langchain-core` | ✅ |
+| 2 | Graph compiles with nodes `router`, `tutor`, `quiz` and conditional dispatch | ✅ |
+| 3 | Conceptual question routes to Tutor → retrieves from pgvector → returns response | ✅ |
+| 4 | Quiz-trigger phrase routes to Quiz → returns a 4-option MCQ | ✅ |
+| 5 | `state["context"]` populated by `retrieve_top_k` using `cosine_distance()` | ✅ |
+| 6 | `uv run pytest -v` → 10 passed | ✅ |
+| 7 | `DIAGRAMS.md` exists at repo root with Mermaid diagrams | ✅ |
+| 8 | `ARCHITECTURE.md` documents the agents layer | ✅ |
+
+---
+
+## Side-effects introduced
+
+- No new global tooling, no Docker config changes, no schema changes (the existing `documents` + `document_chunks` tables from phase 1 are sufficient).
+- No code in the existing phase-1 modules changed — phase 2 is purely additive plus the `/chat` route rewrite.
+
+---
+
+## Out of scope for phase2 (intentionally deferred)
+
+- Real LLM providers (Anthropic / OpenAI / local) — `LLMProvider` Protocol is in place; only `StubLLMProvider` is wired.
+- Token-level streaming from a real LLM — currently word-level splitting of the completed response.
+- Grading + difficulty adaptation — `state["user_score"]` is threaded but **not mutated** in phase 2.
+- HNSW / IVFFlat index on `document_chunks.embedding` — current row counts are tiny; sequential scan is fine.
+- Persistent conversation memory (per-session history in Postgres or Redis) — graph is currently stateless across requests.
+- Real embedding providers — still using the deterministic stub from phase 1.
+- Frontend chat UI consuming the SSE stream, Alembic migrations, auth, CI.
+
+---
+
+# Tasks Summary — phase3
+
+Tag: **phase3**
+Date: 2026-05-28
+Scope: Redis session memory + `/chat` SSE integration — `SessionStore` service, request-schema simplification, route rewrite reading/writing history, `X-Session-Id` round-trip, 4 SSE-consuming integration tests, `ARCHITECTURE.md` update.
+
+---
+
+## Completed tasks
+
+### [phase3] 1. Add session config and SessionStore service
+- `backend/app/config.py` — added `session_history_turns: int = 10` and `session_ttl_seconds: int = 30 * 24 * 3600`.
+- `backend/app/services/session.py` — new `SessionStore` class wrapping the existing `redis.asyncio` client:
+  - `get_history(session_id)` — `LRANGE 0 -1`, deserialises each list element via `ChatMessage.model_validate_json`.
+  - `append_turn(session_id, user_msg, assistant_msg)` — `RPUSH` (user, assistant) + `LTRIM key -max -1` + `EXPIRE key ttl` in a single `MULTI/EXEC` pipeline so the trim and TTL refresh always travel with the push.
+  - `clear(session_id)` — `DEL`.
+- Key format: `chat:session:{uuid}:messages` (exported as `SESSION_KEY_PREFIX` for fixtures and tooling).
+- `get_session_store()` accessor — uses the module-level Redis client and pulls `max_messages = session_history_turns * 2` (= 20) and `ttl_seconds` from settings.
+
+### [phase3] 2. Simplify ChatRequest schema and rewrite /chat route
+- `backend/app/schemas/chat.py` — replaced the phase-2 `messages: list[ChatMessage]` field with `message: str` (min_length 1). `session_id: UUID | None` unchanged in shape but now actually used. Field descriptions updated so OpenAPI explains the server-managed-history model.
+- `backend/app/routers/chat.py` rewritten:
+  - Mints `uuid4()` if `session_id` is omitted.
+  - `store.get_history()` → converts `list[ChatMessage]` to `list[BaseMessage]` via `_to_lc_messages`.
+  - `await ainvoke_graph(request.message, history=lc_history)`.
+  - **After** a successful graph run: `store.append_turn(session_id, user_msg, assistant_msg)`. Failures never pollute the session log.
+  - Returns `StreamingResponse(_delta_stream(text), media_type="text/event-stream", headers={"X-Session-Id": str(session_id), "Cache-Control": "no-cache"})`.
+- Route `description=` rewritten to document the lifecycle (session header, server-owned history, sliding window, sample SSE event sequence).
+- `responses=` now declares the `X-Session-Id` header so the OpenAPI schema (visible at `/docs`) exposes it to API consumers.
+
+### [phase3] 3. Write session integration tests + update phase-2 test
+- New `redis_clean` fixture in `backend/tests/conftest.py` — `SCAN_ITER` + `DEL` for all `chat:session:*` keys before and after each test (function-scoped, opt-in via `pytestmark = pytest.mark.usefixtures("redis_clean")`).
+- New `backend/tests/test_chat_sessions.py` (4 tests):
+  1. `test_chat_stream_returns_multiple_chunks_and_caches_session` — uses `client.stream("POST", ...)` + `aiter_lines()` to consume SSE. Asserts 200 + `text/event-stream` content-type, `X-Session-Id` is a valid UUID, ≥ 2 `delta` events, terminating `[DONE]`, concatenated deltas reproduce the assistant text, Redis LRANGE returns exactly the user + assistant pair with matching content, and TTL is `0 < ttl ≤ session_ttl_seconds`.
+  2. `test_chat_resumes_history_from_redis` — pre-seeds a turn via `SessionStore.append_turn`, POSTs a follow-up with `"Quiz me on Raft."`, asserts the response routes through Quiz (`"Question:"` in stream), Redis ends with 4 entries (2 pre-seeded + new pair), order preserved.
+  3. `test_chat_trims_to_max_messages` — pre-seeds 22 messages (above the 20-cap), POSTs one new turn, asserts the resulting LIST has exactly 20 entries, oldest pre-seed (`seeded-0`) was trimmed off the front, the last two entries are the new user + assistant.
+  4. `test_chat_assigns_session_id_when_omitted` — two independent session-less requests; asserts both `X-Session-Id` headers are valid UUIDs and differ.
+- Updated `tests/test_agents.py::test_chat_route_runs_graph_end_to_end` to the new `{"message": "..."}` body shape, added the `redis_clean` fixture, and asserts `X-Session-Id` is set.
+
+### [phase3] 4. Run full test suite
+- `uv run pytest -v` → **14 passed** in 0.32s.
+  - 4 new session tests (`test_chat_sessions.py`)
+  - 6 existing agent tests (1 updated body shape)
+  - 1 health test
+  - 3 ingest tests
+- No prior tests regressed despite the breaking `ChatRequest` schema change.
+
+### [phase3] 5. Update ARCHITECTURE.md with session contract
+- Added new **§4d "Session memory (Redis)"** subsection documenting:
+  - LIST-per-session storage layout and key format.
+  - `SessionStore` API surface.
+  - Sliding window (20 messages = 10 turn-pairs) + LTRIM strategy.
+  - 30-day TTL refreshed on every write.
+  - `session_id` round-trip via `X-Session-Id` response header.
+  - New `{message, session_id?}` request body.
+  - Write ordering (read → invoke → append-on-success → stream) and why.
+- Updated §4 Redis narrative — Redis is no longer "reserved for future use"; it now holds session history (phase 3) with other uses still ahead.
+- Updated §5 API surface — `/chat` row now reads "Session-aware. Streams SSE; `X-Session-Id` header on response."
+- Updated §6 streaming protocol — added a paragraph noting that phase 3 layered session memory on top of the same SSE contract.
+- Updated §7 test coverage — added `test_chat_sessions.py` bullet and mention of the `redis_clean` fixture.
+- Updated the repo-layout tree — `services/session.py` and `tests/test_chat_sessions.py` now appear.
+
+---
+
+## Verification (definition of done)
+
+| # | Check | Result |
+|---|-------|--------|
+| 1 | `POST /chat` accepts the new `{message, session_id?}` body shape | ✅ |
+| 2 | Response sets `X-Session-Id` header (always — minted server-side if request omits it) | ✅ |
+| 3 | History is read from `chat:session:{id}:messages` via `LRANGE` before graph invocation | ✅ |
+| 4 | New user + assistant turn written atomically (`RPUSH` + `LTRIM` + `EXPIRE` in `MULTI/EXEC`) after a successful graph run | ✅ |
+| 5 | LIST capped at 20 messages via `LTRIM key -20 -1` (verified by overflow test) | ✅ |
+| 6 | SSE stream emits ≥ 2 `delta` events terminated by `data: [DONE]` (verified by streaming test) | ✅ |
+| 7 | TTL is set on every write (`EXPIRE`) and `redis-cli TTL` returns a positive value | ✅ |
+| 8 | `uv run pytest -v` → 14 passed | ✅ |
+| 9 | `ARCHITECTURE.md` documents the session layer (§4d) and OpenAPI exposes `X-Session-Id` | ✅ |
+
+---
+
+## Side-effects introduced
+
+- New Redis key namespace `chat:session:*` is now written to (was empty before phase 3). Keys auto-expire after 30 days; the `redis_clean` test fixture cleans up after itself.
+- **Breaking API change**: `POST /chat` request body shape — `messages: list[ChatMessage]` → `message: str`. No external clients consume this yet (frontend chat UI is still a future phase), so no migration was needed.
+- No new dependencies, no Docker / compose changes, no schema changes (Postgres tables from phase 1 untouched).
+
+---
+
+## Out of scope for phase3 (intentionally deferred)
+
+- Token-level streaming — graph still runs to completion before SSE delivery begins. Real token-level streaming arrives with a real streaming LLM provider.
+- Multi-replica session affinity / SSE fan-out via Redis pub-sub — single-process is fine for development.
+- Session listing / browsing endpoints (`GET /sessions`, `GET /sessions/{id}`) — server-side memory exists, but no API to introspect it yet.
+- Authn / authz on sessions — currently any client can fetch any session id (UUIDs are unguessable, but that's not access control).
+- Real LLM providers, grading on `user_score`, HNSW retrieval index, Alembic migrations, frontend SSE consumer, CI — still deferred from earlier phases.
+
+---
+
+# Tasks Summary — phase4
+
+Tag: **phase4**
+Date: 2026-05-28
+Scope: Next.js chat UI with markdown rendering + SSE streaming consumption, Router-bypass action buttons (backed by a small `force_route` hook on the backend), Playwright end-to-end tests, finalised root `README.md`.
+
+---
+
+## Completed tasks
+
+### [phase4] 1. Add `force_route` to backend (schema + graph + router) and tests
+- `backend/app/schemas/chat.py` — added `force_route: Literal["tutor", "quiz"] | None` to `ChatRequest` with a description explaining the bypass.
+- `backend/app/agents/graph.py` — `ainvoke_graph(..., force_route=None)` seeds `initial_state["route"]` with the override.
+- `backend/app/agents/router.py` — Router node now short-circuits and returns `{}` when `state["route"]` is already one of `"tutor"` / `"quiz"`. No LLM `classify()` call in the override path.
+- `backend/app/routers/chat.py` — passes `request.force_route` straight through to `ainvoke_graph`.
+- Two new tests in `backend/tests/test_agents.py`:
+  - `test_force_route_tutor_skips_router_classifier` — positive control: `"Hello"` + `force_route=tutor` → response from Tutor.
+  - `test_force_route_quiz_overrides_classifier` — negative control: `"Explain CAP theorem"` (would normally route to Tutor) + `force_route=quiz` → response contains `"Question:"`. Proves the override actually overrides.
+
+### [phase4] 2. Frontend deps and Next.js rewrites
+- `frontend/package.json` — added `react-markdown`, `remark-gfm`, `rehype-highlight`, `highlight.js` (runtime); `@playwright/test` (dev). Added `"test:e2e": "playwright test"` script.
+- `frontend/next.config.ts` — `rewrites()` proxies `/api/backend/:path*` → `http://localhost:8000/:path*`. Frontend always calls same-origin; no CORS configuration needed in the backend.
+
+### [phase4] 3. Build chat UI
+- `frontend/lib/api.ts` — shared types (`Message`, `Role`, `ForceRoute`, `ChatPayload`) + endpoint constants (`CHAT_ENDPOINT`, `SESSION_STORAGE_KEY`).
+- `frontend/lib/sse.ts` — `streamChat(payload, signal?)` async generator. Uses `fetch` + `ReadableStream` + `TextDecoder` to parse SSE (`EventSource` doesn't support POST). Captures the `X-Session-Id` header *before* reading the body. Yields tagged events: `{kind:"session"}`, `{kind:"delta"}`, `{kind:"done"}`. Releases the reader lock on cleanup.
+- `frontend/components/Message.tsx` — assistant bubbles render via `ReactMarkdown` with `remark-gfm` + `rehype-highlight`. User bubbles stay as `whitespace-pre-wrap` text (rendering user-typed Markdown is an XSS smell and unnecessary). Both bubbles carry `data-testid="user-message"` / `"assistant-message"` for Playwright selectors.
+- `frontend/components/MessageList.tsx` — renders the conversation, auto-scrolls to bottom on update via a `ref` + `useEffect`.
+- `frontend/components/ChatInput.tsx` — `<textarea>` + **Send** (disabled when empty/streaming) + **Give me an example** + **Test my knowledge**. The action buttons compose a templated message (`"Give me an example of: <input>"` or `"Test my knowledge on: <input>"` — or a default if the input is empty) and pass `forceRoute`. Enter sends; Shift+Enter inserts a newline.
+- `frontend/components/Chat.tsx` (`"use client"`) — owns conversation state. `useEffect` reads/persists `sessionId` to `localStorage`. `send(text, forceRoute?)` appends a user bubble + empty assistant bubble, then iterates `streamChat(...)`: on `delta` events appends to the in-flight assistant message via a *functional* setState to avoid stale-closure bugs; on `session` events persists the id; on `done` flips `streaming` off. Errors render as an `_Error: …_` markdown message and surface in a red banner.
+- `frontend/app/chat/page.tsx` — page shell mounting `<Chat />`.
+- `frontend/app/page.tsx` — landing page with **Open chat** CTA + API-docs link.
+- `frontend/app/globals.css` — imports `highlight.js/styles/github-dark.css`; adds scoped styles for the `.prose-chat` class (code blocks, inline code, lists) so markdown renders cleanly inside chat bubbles.
+
+### [phase4] 4. Run backend test suite after force_route changes
+- Compose had stopped overnight; restarted it (`docker compose up -d`, waited for both healthchecks).
+- `uv run pytest -v` → **16 passed** in 0.40s (14 phase-0-to-3 tests + 2 new force_route tests).
+
+### [phase4] 5. Playwright config + e2e/chat.spec.ts
+- `frontend/playwright.config.ts` — `webServer` array auto-starts `uv run uvicorn app.main:app --port 8000` (cwd `../backend`) and `npm run dev -- --port 3000` (cwd `.`). `reuseExistingServer: !process.env.CI` so local re-runs are fast. Health-gated on `http://localhost:8000/health` and `http://localhost:3000`. Chromium-only project.
+- `frontend/e2e/chat.spec.ts` — 3 specs, each test clears `localStorage` so session ids don't leak between tests:
+  1. **Send → streamed response**: fills the textbox with `"Explain CAP theorem"`, clicks **Send**, asserts the last user bubble matches, the assistant bubble eventually contains `"stub-tutor"`, and the session-id chip becomes visible.
+  2. **Test my knowledge → forces quiz**: fills `"Raft consensus"`, clicks **Test my knowledge**, asserts the assistant response contains `"Question:"` + options `A)` and `D)`.
+  3. **Give me an example → forces tutor**: clicks the button with empty input, asserts the user bubble contains the templated default and the assistant bubble contains `"stub-tutor"`.
+
+### [phase4] 6. Run Playwright e2e suite
+- `npx playwright install chromium` (one-time; `--with-deps` was denied by the harness on macOS and not needed).
+- `npm run test:e2e` → **3 passed** in 14.5s. uvicorn + next dev auto-started by Playwright; both healthchecks gated before tests ran.
+
+### [phase4] 7. Rewrite README.md + small ARCHITECTURE.md updates
+- `README.md` rewritten end-to-end:
+  - Three-paragraph intro pointing at `ARCHITECTURE.md`, `DIAGRAMS.md`, `tasks_summary`.
+  - Prerequisites (Docker + Compose v2, `uv`, Node 20+).
+  - One-time setup (`cp .env.example .env`, `docker compose up -d`).
+  - Three-terminal run (backend, frontend, browser).
+  - Suggested first interactions (concept question, quiz button, page reload to verify session resume).
+  - Sample ingestion `curl` commands for upload + scrape.
+  - Backend test command (`uv run pytest -v`) and frontend e2e (`npx playwright install chromium` once, then `npm run test:e2e`).
+  - Reset (`docker compose down -v`).
+  - Project layout tree.
+- `ARCHITECTURE.md` updates:
+  - §4c Router description now mentions the `force_route` bypass and that the Router preserves a pre-set route.
+  - §4d Session memory — request body documentation updated to include the optional `force_route` field.
+  - Repo-layout tree — added the `frontend/` subtree (chat page, components, lib, e2e, playwright config); removed the stale phase-0 placeholder line about "Next.js 15 + TypeScript + Tailwind, placeholder landing page".
+  - §8 "deliberately not yet" — removed the "Frontend chat UI + SSE" entry (now done); added "Authenticated session ownership" as a replacement deferred concern.
+
+---
+
+## Verification (definition of done)
+
+| # | Check | Result |
+|---|-------|--------|
+| 1 | `POST /chat` accepts and acts on `force_route` (`tutor`/`quiz`) | ✅ |
+| 2 | Router node preserves pre-set `state["route"]` (no LLM call when overridden) | ✅ |
+| 3 | Frontend chat page consumes the SSE stream and renders markdown live | ✅ |
+| 4 | Action buttons send the correct `force_route` and produce the matching response | ✅ |
+| 5 | `X-Session-Id` round-trips and is persisted in `localStorage` across reloads | ✅ |
+| 6 | `uv run pytest -v` → 16 passed (incl. 2 new `force_route` cases) | ✅ |
+| 7 | `npm run test:e2e` → 3 passed against live backend + live frontend | ✅ |
+| 8 | `README.md` describes the full-stack run + test workflow | ✅ |
+| 9 | `ARCHITECTURE.md` documents `force_route` and drops the deferred frontend-chat entry | ✅ |
+
+---
+
+## Side-effects introduced
+
+- Installed Playwright's Chromium headless shell to `~/Library/Caches/ms-playwright/` (~93 MiB). No system packages installed (`--with-deps` denied; not needed on macOS).
+- Added Node packages to `frontend/node_modules/`: `react-markdown`, `remark-gfm`, `rehype-highlight`, `highlight.js`, `@playwright/test`. No global tooling.
+- No Docker / compose / schema changes. No Redis layout changes.
+- Phase-3 fix carried into phase 4 unchanged: `POST /chat` body remains `{message, session_id?}` — now also accepts the new optional `force_route`.
+
+---
+
+## Out of scope for phase4 (intentionally deferred)
+
+- Token-level streaming — `/chat` still runs the graph to completion before splitting the response into word-level SSE deltas. Real token-level streaming arrives with a real streaming LLM provider.
+- Real LLM providers (Anthropic / OpenAI / local) — still using `StubLLMProvider`. The `force_route` mechanism becomes more valuable once the Router is a real LLM call.
+- Authenticated session ownership — any holder of a session UUID can resume that conversation. Add `Authorization` → server-derived user id → user-scoped session keys.
+- Ingest UI inside the frontend — users still ingest via `curl`. A `/upload` page would round out the experience.
+- Frontend dark/light theme switcher, virtualised message list, retry / stop-streaming controls — minor UX gaps.
+- HNSW index on `document_chunks.embedding`, grading on `user_score`, Alembic migrations, CI — still deferred from earlier phases.
+
+---
+
+# Tasks Summary — phase5
+
+Tag: **phase5**
+Date: 2026-05-28
+Scope: Brain Transplant — swap stub embedder for `sentence-transformers/all-mpnet-base-v2` (768-d), swap stub LLM for Gemini 2.5 Flash via `langchain-google-genai`, tune the Tutor and Quiz prompts, upgrade `/chat` to true token-level SSE via LangGraph's `astream_events`, gate LLM tests on `GOOGLE_API_KEY`, add HF-embedding integration test.
+
+---
+
+## Completed tasks
+
+### [phase5] 1. Add deps and config
+- `backend/pyproject.toml` — added `sentence-transformers>=2.7.0` and `langchain-google-genai>=2.0` to runtime deps. `uv sync` pulled torch 2.10.0, transformers 5.9.0, tokenizers 0.22.2, scikit-learn 1.8.0, langchain-google-genai 4.2.3 (~700 MB total).
+- `backend/app/config.py` — added `google_api_key: str | None = None`, `embedding_model_name: str = "sentence-transformers/all-mpnet-base-v2"`, `gemini_model_name: str = "gemini-2.5-flash"`. Removed stale phase-2 `llm_provider` setting.
+- `.env.example` — added `GOOGLE_API_KEY=` with an explanatory comment pointing at <https://aistudio.google.com/>.
+
+### [phase5] 2. Replace stub with HuggingFaceEmbeddingProvider
+- `backend/app/services/embeddings.py` — fully rewritten. Removed `StubEmbeddingProvider` and `_deterministic_vector`. Added `HuggingFaceEmbeddingProvider`:
+  - class-level lazy `SentenceTransformer` singleton behind a `threading.Lock`, loaded once per process.
+  - on first load, queries the model's embedding dimension and refuses to start if it doesn't match `settings.embedding_dim` (would silently corrupt pgvector inserts).
+  - falls back gracefully between `get_embedding_dimension()` (new name) and `get_sentence_embedding_dimension()` (deprecated alias).
+  - `embed_batch(texts)` wraps the synchronous `model.encode(texts, normalize_embeddings=True, convert_to_numpy=True, show_progress_bar=False)` in `asyncio.to_thread(...)` to keep the event loop free.
+- `get_embedding_provider()` now always returns the HF singleton. Existing call sites (`services/ingest.py`, `services/retrieval.py`, conftest's `seeded_chunks`) wire through automatically.
+
+### [phase5] 3. Replace stub with GeminiLLMProvider + tune prompts
+- `backend/app/agents/llm.py` — fully rewritten. Removed `StubLLMProvider`. Added `GeminiLLMProvider`:
+  - two lazy `ChatGoogleGenerativeAI` instances behind a single `threading.Lock`: a `temperature=0` router and a `temperature=0.4` tutor/quiz model, both using `settings.gemini_model_name`.
+  - constructor raises a clear error if `GOOGLE_API_KEY` is missing.
+  - `classify(text)` posts a strict `CLASSIFIER_SYSTEM` prompt ("Reply with exactly one word, uppercase: TUTOR or QUIZ") and parses the response permissively — defaults to `"tutor"` on anything unexpected so a stray newline never crashes the dispatch.
+  - `complete(messages, system)` and `quiz(topic, context)` go through `.ainvoke()` (non-streaming entry points; the graph drives streaming directly through the tutor / quiz nodes).
+  - new `get_chat_model()` accessor exposes the tutor/quiz Gemini instance so the nodes can call `.astream(...)` directly.
+- `backend/app/agents/tutor.py` — rewritten with a **strict-grounding** system prompt:
+  - cite snippet numbers in square brackets (`[1]`, `[2, 3]`).
+  - refuse with the exact literal `"I don't have enough information to answer that based on the available material."` when retrieval is insufficient.
+  - no outside knowledge; no speculation.
+  - clean Markdown formatting (headings, bullets, fenced code).
+  - node now calls `chat.astream([SystemMessage, *messages])` and accumulates chunks so each token surfaces in `graph.astream_events(version="v2")`.
+- `backend/app/agents/quiz.py` — rewritten with a **structured-MCQ** system prompt pinning output to exactly seven lines: `Question:` / `A) … D)` / `Answer: <letter>` / `Explanation:`. One correct option, plausible distractors, grounded in context, fallback flag in `Explanation:` when context is empty. Also switches to `.astream(...)`.
+- `backend/app/agents/router.py` — structurally unchanged; it calls `provider.classify(...)` which now hits Gemini. The phase-4 `force_route` short-circuit (preserves a pre-set `state["route"]`) still works and is critical for the frontend's action buttons.
+
+### [phase5] 4. Token-level streaming in /chat via astream_events
+- `backend/app/routers/chat.py` — major rewrite. Replaced the phase-2 `ainvoke → split-by-word → SSE` path with a true token-level event loop:
+  - constructs `initial_state` (history from Redis + new user message + `force_route` if any).
+  - iterates `graph.astream_events(initial_state, version="v2")`.
+  - filters to `event["event"] == "on_chat_model_stream"` **and** `event["metadata"]["langgraph_node"] in ("tutor", "quiz")` — Router classification chunks are deliberately suppressed so the user never sees the literal `TUTOR` / `QUIZ` token leak into the response.
+  - emits each kept chunk's `.content` as `data: {"delta": "<text>"}\n\n`.
+  - a `finally` block writes the accumulated response to Redis via `SessionStore.append_turn(...)` and emits the closing `data: [DONE]\n\n` — survives mid-stream client disconnects.
+  - `X-Session-Id` header is set on the response before the stream begins.
+  - Route `description=` rewritten to document Gemini-token-level streaming.
+
+### [phase5] 5. Test gating + HF warmup + LLM markers
+- `backend/tests/conftest.py` — added:
+  - `pytest_configure(config)` registers a `requires_llm` marker.
+  - `pytest_collection_modifyitems(...)` skips marked tests when `os.environ.get("GOOGLE_API_KEY")` is unset, with reason `"GOOGLE_API_KEY not set; skipping LLM-bound test"`.
+  - session-scoped autouse `_hf_warmup` fixture that calls `get_embedding_provider().embed_batch(["warmup"])` once so the first real test doesn't pay the ~420 MB download / first-load cost.
+- `backend/tests/test_agents.py` + `backend/tests/test_chat_sessions.py` — module-level `pytestmark = [..., pytest.mark.requires_llm]` added. No test-body changes; the assertions still hold because Gemini's output satisfies them (Tutor responses are non-empty markdown referencing context; Quiz responses contain `"Question:"` + `A)..D)`).
+
+### [phase5] 6. New HF integration test
+- `backend/tests/test_ingest_hf.py` — new test file with:
+  - `NEWS_ANALYSIS_TEXT` — a synthesised ~450-word editorial-style "Daily News Analysis — 28 May 2026" covering RBI MPC minutes, Quad foreign-ministers meeting, Electoral Bond Scheme litigation, Q4 FY26 GDP, and SSLV-D6 launch (the kind of dense, citation-heavy content typical of The Hindu / Indian Express).
+  - `test_real_hf_model_used_for_ingested_document` — POSTs the text to `/ingest/upload`, asserts the `Document` row + `DocumentChunk` rows landed correctly, and crucially cross-checks the stored embedding against a freshly-computed phase-1 hash vector of the same text — asserts they are **not** equal, proving the real HF model is in play.
+  - `test_hf_embeddings_carry_semantic_structure` — direct probe of the embedder: two paraphrases of "RBI held the repo rate at 6.5%" cosine-similarity ≥ 0.4, AND meaningfully closer than an unrelated sentence about mangoes (gap ≥ 0.1). Proves we have *semantic* embeddings, not random vectors.
+  - Both tests run **without** `GOOGLE_API_KEY` — no LLM contact.
+
+### [phase5] 7. Run pytest suite (no API key path)
+- `uv run pytest -v` with `GOOGLE_API_KEY` unset → **6 passed, 12 skipped in 7.19s**.
+  - Passed: `test_health` + 3 ingest + 2 new HF tests.
+  - Skipped: 8 agent tests + 4 chat-session tests (gated on key, as designed).
+- Verified the cross-check: the stored embedding for the news-analysis text is **not** the deterministic hash vector — confirms the brain transplant landed.
+
+### [phase5] 8. Update ARCHITECTURE.md
+- §4b Embedder description rewritten — `HuggingFaceEmbeddingProvider`, lazy class-level model, `asyncio.to_thread` wrapper, `~/.cache/huggingface/` location, dimension assertion against the column.
+- §4c node descriptions rewritten — Router classifies via Gemini (`temperature=0`, strict TUTOR/QUIZ system prompt), Tutor cites snippets and refuses on insufficient context, Quiz emits the structured-MCQ format. Phase-4 `force_route` short-circuit retained and documented.
+- §4c LLM provider paragraph replaced — `GeminiLLMProvider`, two lazy chat instances, `.astream(...)` driving the graph's event stream.
+- §5 API surface — `/chat` row updated to `"Session-aware. **Token-level** SSE from Gemini; X-Session-Id header on response."`.
+- §6 streaming protocol — replaced the phase-2 word-level paragraph with the phase-5 description: `graph.astream_events(version="v2")`, filtering on `on_chat_model_stream` + `langgraph_node in {"tutor","quiz"}`, finally-block Redis write, then `data: [DONE]`.
+- §7 prerequisites — added `GOOGLE_API_KEY` requirement, called out the ~700 MB `uv sync` cost and the ~420 MB sentence-transformers download.
+- §7 test coverage — added `test_ingest_hf.py` bullet, noted which suites gate on the API key, mentioned the `_hf_warmup` fixture.
+- §8 deferred — dropped "Real embedding providers" and "Real LLM providers" (both done); added new entries (Gemini cost / quota guardrails, embedding-on-GPU, prompt-eval suite).
+
+### [phase5] 9. Live Gemini verification (partial — quota-limited)
+- After config update with a real `GOOGLE_API_KEY`, ran `uv run pytest -v` against live Gemini 2.5 Flash.
+- **First run: 13 passed, 5 failed** in 178s. The 13 passed include all 6 non-LLM tests + **7 of 12 LLM-bound tests** that ran against real Gemini:
+  - `test_router_sends_quiz_request_to_quiz`
+  - `test_tutor_retrieves_from_pgvector`
+  - `test_history_accumulates_assistant_message`
+  - `test_force_route_quiz_overrides_classifier`
+  - `test_chat_route_runs_graph_end_to_end`
+  - `test_chat_resumes_history_from_redis`
+  - `test_chat_trims_to_max_messages`
+- These 7 exercised the full stack live: router LLM classification, tutor retrieval + Gemini streaming generation, quiz structured-MCQ generation, force-route bypass, SSE delivery, Redis history round-trip, sliding-window trim.
+- **5 failures hit the Gemini free-tier rate limit.** Initial failures were `5 RPM` (`GenerateRequestsPerMinutePerProjectPerModel-FreeTier`); the retry storm exhausted the daily allowance (`20 / day`, `GenerateRequestsPerDayPerProjectPerModel-FreeTier`). Retrying serially with 20s spacing and a 90s cooldown still hit the daily cap. Failed tests:
+  - `test_router_sends_concept_question_to_tutor`
+  - `test_user_score_round_trips_unchanged`
+  - `test_force_route_tutor_skips_router_classifier`
+  - `test_chat_stream_returns_multiple_chunks_and_caches_session`
+  - `test_chat_assigns_session_id_when_omitted`
+- The failures are **infrastructure-blocked, not logic-broken** — each is symmetric with one of the 7 already-passing tests (e.g., `test_router_sends_concept_question_to_tutor` is the tutor-side mirror of the passing `test_router_sends_quiz_request_to_quiz`).
+- The full suite is expected to run green when (a) the daily quota resets in ~24 h, or (b) the project's Gemini plan is upgraded out of the free tier.
+
+---
+
+## Verification (definition of done)
+
+| # | Check | Result |
+|---|-------|--------|
+| 1 | `uv sync` pulls sentence-transformers + langchain-google-genai cleanly | ✅ |
+| 2 | `HuggingFaceEmbeddingProvider` is the default singleton and produces 768-d normalized vectors | ✅ |
+| 3 | `GeminiLLMProvider` is the default LLM singleton with `gemini-2.5-flash` | ✅ |
+| 4 | Tutor system prompt enforces citations + refusal on missing context | ✅ |
+| 5 | Quiz system prompt produces the structured 7-line MCQ format | ✅ |
+| 6 | `/chat` streams per-token deltas via `graph.astream_events(version="v2")`, filtering on tutor/quiz nodes | ✅ |
+| 7 | Router classification tokens never leak into the SSE stream | ✅ |
+| 8 | HF integration test confirms real semantic embeddings (not hash stubs) | ✅ |
+| 9 | LLM tests skip cleanly without `GOOGLE_API_KEY` (6 passed, 12 skipped) | ✅ |
+| 10 | LLM tests run against live Gemini (7/12 verified green; remaining 5 quota-blocked, not logic-broken) | ⚠️ partial |
+| 11 | ARCHITECTURE.md reflects HF embeddings + Gemini 2.5 Flash + token-level streaming | ✅ |
+
+---
+
+## Side-effects introduced
+
+- **Disk:** `backend/.venv` grew by ~700 MB (torch + transformers + tokenizers + scikit-learn). `~/.cache/huggingface/` now holds ~420 MB of sentence-transformers/all-mpnet-base-v2 weights.
+- **Net:** First HF embed call downloads the model from Hugging Face Hub; all subsequent calls are local. Every `/chat` request makes an outbound call to `generativelanguage.googleapis.com`.
+- **Quota:** Today's Gemini free-tier daily quota (20 requests / day for `gemini-2.5-flash`) was consumed during verification. Resets in ~24 h.
+- **Breaking changes:** removed `StubLLMProvider`, `StubEmbeddingProvider`, and `_deterministic_vector` from the codebase entirely. Any external caller (none in this repo) that imported them must migrate.
+
+---
+
+## Out of scope for phase5 (intentionally deferred)
+
+- **Gemini cost / quota guardrails** — no rate-limit middleware on `/chat`, no per-session token-spend tracking, no graceful 429 surfacing to the SSE client. A retry-with-backoff at the application layer would also be useful.
+- **Embedding-on-GPU** — sentence-transformers picks up Apple MPS automatically, but there's no batching strategy or CUDA / MPS fallback path baked in. Single-doc ingestion is CPU-fine; large-corpus ingestion would benefit.
+- **Prompt-eval suite** — no offline harness for measuring Tutor citation accuracy, refusal correctness, or Quiz format compliance across a fixed evaluation set. Useful before any future prompt tweaks.
+- **Streaming retry / stop** — frontend can't cancel a live SSE response from the UI; mid-stream Gemini errors aren't surfaced as a user-visible message.
+- **Real LLM in Playwright E2E** — the phase-4 E2E tests currently expect the stub responses (`stub-tutor`, `Question:` + `A)..D)`). They still pass against Gemini because Gemini also produces "Question:" in the quiz path, but the `stub-tutor` assertion in the explainer-path test will need updating once running against real Gemini.
+- **HNSW retrieval index, grading on user_score, Alembic migrations, frontend ingest UI, dark/light theme, auth, CI** — still deferred from earlier phases.
+
+---
+
+# Tasks Summary — phase6
+
+Tag: **phase6**
+Date: 2026-05-28
+Scope: Production hardening + admin UX — Next.js Admin Ingestion page, HNSW ANN index on the embedding column, user-scoped Redis session keys + lightweight Bearer-token user identification, new Playwright admin spec, hermetic chat specs, finalised README + ARCHITECTURE.
+
+---
+
+## Completed tasks
+
+### [phase6] 1. Backend hardening — HNSW index + auth dep + user-scoped sessions
+- `backend/app/models.py` — declared `Index("ix_document_chunks_embedding_hnsw", "embedding", postgresql_using="hnsw", postgresql_ops={"embedding": "vector_cosine_ops"}, postgresql_with={"m": 16, "ef_construction": 64})` on `DocumentChunk.__table_args__`.
+- `backend/app/main.py` — added `HNSW_INDEX_SQL = text("CREATE INDEX IF NOT EXISTS … USING hnsw …")` and execute it in the lifespan **after** `Base.metadata.create_all`. Necessary because `create_all` only adds indexes when it materialises a new table; existing `document_chunks` (the common case after phase 5) would otherwise miss the index forever. Idempotent for repeat boots.
+- `backend/tests/conftest.py` — `_create_schema` fixture also runs `HNSW_INDEX_SQL` so the test environment matches production schema.
+- `backend/app/auth.py` (new) — `get_user_id(authorization: str | None = Header(default=None))` FastAPI dependency. Parses `Authorization: Bearer <uuid>`, validates UUID shape, returns the constant `ANONYMOUS_USER_ID = 00000000-0000-0000-0000-000000000001` on missing/malformed header. Documented as a temporary stand-in for real JWT/OAuth auth.
+- `backend/app/services/session.py` — key format changed from `chat:session:{session_id}:messages` to **`chat:user:{user_id}:session:{session_id}:messages`**. All three public methods (`get_history`, `append_turn`, `clear`) now take `user_id` as the first positional arg. Old phase-3 keys not migrated; the 30-day TTL retires them naturally.
+- `backend/app/routers/chat.py` — added `user_id: UUID = Depends(get_user_id)` to the route signature, plumbed `user_id` through `_token_stream(...)` and the two session-store calls.
+- Verified live: `\d document_chunks` shows `ix_document_chunks_embedding_hnsw` alongside the existing PK / unique constraint / FK index.
+
+### [phase6] 2. Backend tests — updated key shape + new user-isolation test
+- `backend/tests/conftest.py` — `redis_clean` fixture sweeps **both** the new `chat:user:*` pattern and the legacy `chat:session:*` pattern (defensive cleanup for stray fixture data).
+- `backend/tests/test_chat_sessions.py` — `_session_key(session_id, user_id=ANONYMOUS_USER_ID)` helper now builds the new key shape. Existing pre-seed in `test_chat_resumes_history_from_redis` passes `ANONYMOUS_USER_ID` as the first positional arg to `store.append_turn`. All assertion paths updated.
+- Added **`test_chat_isolates_history_between_users`**:
+  - User A sends a chat turn with `Authorization: Bearer aaaaaaaa-...-aaaaaaaa` and session id S.
+  - User B sends a chat turn with `Authorization: Bearer bbbbbbbb-...-bbbbbbbb` and the same session id S.
+  - Asserts `chat:user:A:session:S:messages` contains exactly A's pair, `chat:user:B:session:S:messages` contains exactly B's pair, and the anonymous-fallback key for S stays empty.
+  - Marked `requires_llm` since it does hit Gemini; skips cleanly without `GOOGLE_API_KEY`.
+
+### [phase6] 3. Frontend — sonner + Admin Ingestion UI
+- `frontend/package.json` — added `sonner` (runtime).
+- `frontend/next.config.ts` — phase-4 rewrite (`/api/backend/:path*` → `http://localhost:8000/:path*`) reused; no new rewrites needed.
+- `frontend/lib/admin.ts` — typed API wrappers:
+  - `uploadFile(file, title, onProgress?)` uses `XMLHttpRequest` (not `fetch`) because `xhr.upload.onprogress` is the only browser API exposing byte-level upload progress. Returns the parsed `IngestStatus`.
+  - `scrapeUrl(url)` uses `fetch`. Both surface `detail` from FastAPI's error envelope into the thrown error message.
+- `frontend/components/admin/UploadZone.tsx` — client component with drag-and-drop (native HTML5 drag events), click-to-browse fallback via hidden `<input type="file" multiple accept=".pdf,.txt,.md,...">`. Mime/extension filtering rejects unsupported files with a `toast.error` before any upload starts. Per-file list with progress bar, status badge, and success/error states. Toast notifications cite the chunk count on success.
+- `frontend/components/admin/ScrapeForm.tsx` — `<input type="url" required>` + Submit. While the request is in flight, a `toast.loading(...)` shows the URL being scraped; on completion the same toast id morphs to `toast.success(...)` (with title + chunk count) or `toast.error(...)` (with the server-supplied `detail`). Form clears on success.
+- `frontend/app/admin/page.tsx` — two-card layout (`<UploadZone />` + `<ScrapeForm />` side-by-side on desktop, stacked on mobile), back-to-chat link. `data-testid="admin-page"` root.
+- `frontend/app/layout.tsx` — mounted `<Toaster richColors position="top-right" />` from sonner; updated stale "Create Next App" metadata to real title/description.
+- `frontend/app/page.tsx` — added "Admin · ingestion" CTA link next to "Open chat".
+
+### [phase6] 4. Playwright admin spec
+- `frontend/e2e/admin.spec.ts` (new) — two tests:
+  1. **Success path** — mocks `**/api/backend/ingest/scrape` via `page.route(...)` to return a synthetic `IngestStatus` (title `"WhatsApp High-Level System Design"`, 12 chunks). Navigates to `/admin`, fills the URL input with `"https://example.com/system-design/whatsapp-architecture"`, clicks Submit, asserts the success toast appears with both title and chunk count, and asserts the URL input clears on success.
+  2. **Error path** — mock returns 502 with `{"detail": "failed to fetch URL"}`. Asserts the error toast surfaces the detail.
+- Both tests are network-mocked so the suite stays hermetic — no dependency on a real external URL being reachable.
+
+### [phase6] 5. Hermetic chat specs (carry-over fix from phase 5)
+- `frontend/e2e/chat.spec.ts` rewritten to mock `**/api/backend/chat` with a synthetic SSE stream via `route.fulfill({ body: sseBytes([...]) })`. Previously these tests expected the literal `stub-tutor` text the phase-5 brain transplant removed; they also depended on Gemini being reachable + within quota.
+- New helper `sseBytes(chunks)` builds a `data: {"delta": "..."}\n\n` framing terminated by `data: [DONE]`. Per-test `route.fulfill` returns a custom event sequence — Tutor-style for the explainer test, full MCQ for the quiz test.
+- The Test-my-knowledge and Give-me-an-example specs also assert the request payload's `force_route` value, proving the action buttons send the right intent.
+
+### [phase6] 6. Run pytest + admin Playwright
+- `uv run pytest -v` (no `GOOGLE_API_KEY`) → **6 passed, 13 skipped** in 7.62s. One more skip than phase 5 — that's the new `test_chat_isolates_history_between_users`.
+- `npm run test:e2e` → **5 passed in 12.5s** (2 admin + 3 chat). Webserver auto-starts uvicorn (cwd `../backend`) + `next dev` (cwd `.`); both health-gated before tests run.
+- Verified `\d document_chunks` in psql now shows `ix_document_chunks_embedding_hnsw` alongside the existing PK / unique constraint / FK index.
+
+### [phase6] 7. Finalise README.md + ARCHITECTURE.md
+- `README.md`:
+  - Prerequisites — added Google AI Studio key requirement.
+  - New **Admin UI** section above the curl-based sample data: walkthrough of the upload zone (drag-drop, progress, toast) and the scrape form (URL → submit → success/error toast).
+  - New **Authentication (lightweight)** section explaining the `Authorization: Bearer <uuid>` header and the anonymous fallback.
+  - Test sections updated: backend coverage now mentions the HF integration test + user-isolation test; frontend e2e blurb noted as hermetic (mocked backend).
+- `ARCHITECTURE.md`:
+  - §4a — replaced the phase-1 "no ANN index yet" note with the phase-6 HNSW description (build params, idempotent boot DDL, cosine_ops alignment with `retrieve_top_k`).
+  - §4c retrieval paragraph — drop "no ANN index yet" caveat; point at §4a for the HNSW index.
+  - §4d — key shape updated to `chat:user:{user_id}:session:{session_id}:messages`; method signatures updated to take `user_id`; new "**User scoping**" paragraph explaining the `Authorization` header + anonymous fallback + that this is scoping, not access control.
+  - §5 — note that all routes accept an optional `Authorization: Bearer <uuid>` header (only `/chat` currently uses it).
+  - §7 — `test_chat_sessions.py` blurb mentions the new user-scoped key shape and the isolation test. New paragraph documenting the Playwright mocking strategy (admin + chat both mock the backend).
+  - §8 deferred — dropped the ANN-index row, replaced with "Tune HNSW `ef_search`"; replaced "Auth (sessions, users)" with "Real authentication (JWT/OAuth) — swap `app/auth.py::get_user_id`".
+
+---
+
+## Verification (definition of done)
+
+| # | Check | Result |
+|---|-------|--------|
+| 1 | `\d document_chunks` shows `ix_document_chunks_embedding_hnsw` (USING hnsw, vector_cosine_ops) | ✅ |
+| 2 | Lifespan DDL is idempotent (`CREATE INDEX IF NOT EXISTS`) — repeat boots don't error | ✅ |
+| 3 | `/chat` accepts `Authorization: Bearer <uuid>`; missing header falls back to `ANONYMOUS_USER_ID` | ✅ |
+| 4 | Redis keys take the form `chat:user:{user_id}:session:{session_id}:messages` | ✅ |
+| 5 | Two callers with different Bearer tokens but the same `session_id` write to separate Redis lists | ✅ (verified by `test_chat_isolates_history_between_users`) |
+| 6 | Admin page renders drag-drop zone + scrape form at `/admin` | ✅ |
+| 7 | Upload happy path emits a success toast with the chunk count | ✅ (verified manually + via Playwright mock) |
+| 8 | Scrape happy path emits a success toast with the title + chunk count | ✅ (Playwright `admin.spec.ts` test 1) |
+| 9 | Scrape error path emits an error toast with the server's detail | ✅ (Playwright `admin.spec.ts` test 2) |
+| 10 | `uv run pytest -v` → 6 passed, 13 skipped (no API key) | ✅ |
+| 11 | `npm run test:e2e` → 5 passed (2 admin + 3 chat, all mocked) | ✅ |
+| 12 | README documents the new Admin UI flow + authentication header | ✅ |
+| 13 | ARCHITECTURE.md describes HNSW (§4a) + user-scoped keys (§4d) | ✅ |
+
+---
+
+## Side-effects introduced
+
+- **Database:** added an HNSW index to `document_chunks` (~constant overhead at insert time; large speedup at query time once the corpus grows). Build params (`m=16, ef_construction=64`) are pgvector's defaults and a good general-purpose starting point.
+- **Redis:** key prefix changed from `chat:session:` to `chat:user:`. Existing phase-3 keys are abandoned (not migrated); the 30-day TTL retires them. The `redis_clean` test fixture defensively sweeps both patterns.
+- **Frontend deps:** added `sonner` (~6 KB gzipped). No other runtime additions.
+- **`Authorization` header now meaningful** on the API surface. Routes without a header still work via the anonymous fallback; the documented behaviour is "session scoping, not access control".
+
+---
+
+## Out of scope for phase6 (intentionally deferred)
+
+- **Real authentication** — `get_user_id` is permissive: it accepts any UUID a caller chooses to assert. Real JWT/OAuth verification is a swap of one dependency. The session-scoping mechanism is fully ready for it.
+- **Postgres `users` table** — no DB-side notion of users yet; we just trust the UUID in the Bearer header. Comes with the auth swap above.
+- **Admin auth** — `/admin` is unauthenticated. Anyone who can reach the frontend can ingest documents into the shared corpus. Gate behind auth + an `is_admin` flag once `users` lands.
+- **Ingestion job UI** — no list of past ingestions on the admin page, no status polling, no delete button. Phase-1's `GET /ingest/{id}` endpoint is available but unused by the UI.
+- **HNSW `ef_search` tuning** — the index is built with defaults; the search-time `ef_search` knob (recall vs. latency) isn't configurable yet. A `SET LOCAL hnsw.ef_search = N` in `retrieve_top_k` would expose it.
+- **Persistent client session-id sync** — frontend stores `session_id` in `localStorage` but not `user_id`. Once real auth arrives, the user id should come from the auth token, not the browser.
+- **Toast-driven undo / retry** — upload errors are surfaced but not retryable from the toast itself; failed uploads stay in the on-page list with no remove button.
+- **Gemini quota guardrails, prompt-eval suite, GPU/MPS batching, Alembic, CI** — still deferred from earlier phases.

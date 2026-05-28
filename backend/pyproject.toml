@@ -1,0 +1,42 @@
+[project]
+name = "personal-ai-tutor-backend"
+version = "0.1.0"
+description = "FastAPI backend for the personal AI tutor"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "sqlalchemy[asyncio]>=2.0.36",
+    "asyncpg>=0.30",
+    "redis>=5.2",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "python-multipart>=0.0.20",
+    "httpx>=0.28",
+    "llama-index-core>=0.12",
+    "pgvector>=0.3",
+    "beautifulsoup4>=4.12",
+    "lxml>=5.3",
+    "pypdf>=5.1",
+    "numpy>=2.1",
+    "langgraph>=0.2",
+    "langchain-core>=0.3",
+    "langchain-google-genai>=2.0",
+    "sentence-transformers>=2.7.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "fpdf2>=2.8",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
+testpaths = ["tests"]
+
+[tool.uv]
+package = false
