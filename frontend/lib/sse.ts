@@ -5,13 +5,20 @@ export type StreamEvent =
   | { kind: "delta"; text: string }
   | { kind: "done" };
 
+export type GetToken = () => Promise<string | null>;
+
 export async function* streamChat(
   payload: ChatPayload,
   signal?: AbortSignal,
+  getToken?: GetToken,
 ): AsyncGenerator<StreamEvent, void, void> {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  const token = getToken ? await getToken() : null;
+  if (token) headers.Authorization = `Bearer ${token}`;
+
   const res = await fetch(CHAT_ENDPOINT, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers,
     body: JSON.stringify(payload),
     signal,
   });

@@ -10,7 +10,7 @@ A self-hosted AI tutor that ingests user-supplied learning material (uploaded fi
 │   :3000      │                 │       :8000      │            │     :5432              │
 └──────────────┘                 │                  │ ─────────▶ ┌────────────────────────┐
                                  └──────────────────┘   resp     │ Redis 7                │
-                                                                 │     :6379              │
+                                                                 │   host :6380           │
                                                                  └────────────────────────┘
 ```
 
@@ -26,8 +26,10 @@ personal-ai-tutor/
 │   └── 01-extensions.sql       # CREATE EXTENSION vector
 ├── backend/                    # FastAPI service
 │   ├── pyproject.toml          # uv-managed deps
+│   ├── alembic/                # Alembic migrations (env.py is async; baseline = 0001_baseline)
+│   ├── alembic.ini             # script_location = alembic; URL resolved from settings
 │   ├── app/
-│   │   ├── main.py             # app factory, router wiring, OpenAPI metadata, create_all on startup
+│   │   ├── main.py             # app factory, router wiring, OpenAPI metadata (schema owned by Alembic from phase 7)
 │   │   ├── config.py           # pydantic-settings (DB / Redis / embedding dim / upload limits)
 │   │   ├── db.py               # async SQLAlchemy engine + session dep
 │   │   ├── redis_client.py     # redis.asyncio client + dep
@@ -55,7 +57,7 @@ personal-ai-tutor/
 | Process     | Where           | Port | How to start                                  |
 |-------------|-----------------|------|-----------------------------------------------|
 | Postgres    | docker compose  | 5432 | `docker compose up -d postgres`               |
-| Redis       | docker compose  | 6379 | `docker compose up -d redis`                  |
+| Redis       | docker compose  | host 6380 → container 6379 | `docker compose up -d redis`     |
 | FastAPI     | host (uvicorn)  | 8000 | `cd backend && uv run uvicorn app.main:app --reload` |
 | Next.js     | host (npm)      | 3000 | `cd frontend && npm run dev`                  |
 
@@ -69,7 +71,7 @@ The backend runs on the host (not in compose) so the dev loop is as fast as poss
 
 ## 4a. Database schema
 
-Two tables, defined in `backend/app/models.py` and created on app startup via `Base.metadata.create_all()` (lifespan hook). No migration tooling yet — Alembic arrives when the schema grows beyond what `create_all` can safely evolve.
+Two tables, defined in `backend/app/models.py`. **Schema is owned by Alembic** (phase 7) — the baseline revision `0001_baseline` (in `backend/alembic/versions/`) creates the `vector` extension, both tables, the FK + unique constraint, the b-tree FK index, and the HNSW ANN index. Run `alembic upgrade head` before booting the app against a fresh database; for an existing DB, `alembic stamp head` records the baseline without re-issuing DDL.
 
 ```
 ┌─────────────────────────┐         ┌──────────────────────────────┐
@@ -98,7 +100,7 @@ Two tables, defined in `backend/app/models.py` and created on app startup via `B
 - `embedding` — `pgvector` `vector(N)` column. `N = settings.embedding_dim` (768 in phase 1). Changing the dimension later requires a migration; the column is fixed-width.
 - `ON DELETE CASCADE` — re-ingesting a source by deleting its `Document` wipes its chunks atomically.
 
-**ANN index** (phase 6): `ix_document_chunks_embedding_hnsw` is an HNSW index on `embedding` using `vector_cosine_ops` with `m=16, ef_construction=64`. It's declared on the SQLAlchemy model AND issued idempotently on every backend boot via `CREATE INDEX IF NOT EXISTS …` in the lifespan, because `Base.metadata.create_all` skips indexes on tables that already exist. Cosine distance is what `retrieve_top_k` already uses, so the index plugs into the existing query plan without code changes at call sites.
+**ANN index** (phase 6): `ix_document_chunks_embedding_hnsw` is an HNSW index on `embedding` using `vector_cosine_ops` with `m=16, ef_construction=64`. Declared on the SQLAlchemy model AND issued explicitly in the Alembic baseline migration (phase 7 replaced the lifespan `CREATE INDEX IF NOT EXISTS` with a migration-managed index). Cosine distance is what `retrieve_top_k` already uses, so the index plugs into the existing query plan without code changes at call sites.
 
 ## 4b. Ingestion pipeline
 
@@ -149,7 +151,7 @@ Short-term conversation memory is owned by the server. Each chat session is one 
 
 **TTL**: 30 days, refreshed on every write. Configurable via `session_ttl_seconds`.
 
-**User scoping** (phase 6): the route resolves `user_id` from an `Authorization: Bearer <uuid>` header via the `app/auth.py::get_user_id` FastAPI dependency. If the header is missing or malformed, the dependency falls back to `ANONYMOUS_USER_ID = 00000000-0000-0000-0000-000000000001` — single-user dev keeps working without an explicit identifier. The `user_id` is the first component of the Redis key, so two callers can hold the same `session_id` without ever seeing each other's history. This is session scoping, not access control — real authentication slots in by swapping the `get_user_id` dependency for one that verifies a JWT and returns a `users.id`.
+**User scoping & access control** (phase 6 → phase 8): the route resolves `user_id` from an `Authorization: Bearer <jwt>` header via the `app/auth.py::get_user_id` FastAPI dependency. Phase 8 replaces the permissive-UUID parser with **Clerk JWT verification** — every request without a valid Clerk-signed JWT receives `401`. The `sub` claim (a Clerk user id like `user_2abc123def`, a string — not a UUID) becomes the first component of the Redis key, so two callers presenting different JWTs but sharing a `session_id` get fully separate Redis namespaces. This is now real access control, not just scoping. The `DEV_AUTH_BYPASS=1` env var re-enables the permissive parser for ad-hoc curl smoke testing only (warning logged on boot; never set in production).
 
 **Session id round-trip**:
 - Request: `session_id` is **optional**. If present, the server resumes that conversation; if absent, the server mints a fresh `uuid4`.
@@ -161,7 +163,7 @@ Short-term conversation memory is owned by the server. Each chat session is one 
 
 ## 5. API surface
 
-OpenAPI 3.1 spec is served at `/openapi.json`; Swagger UI at `/docs`; ReDoc at `/redoc`. All routes accept an optional `Authorization: Bearer <uuid>` header — currently only used by `/chat` to namespace Redis session keys (§4d). Routes without auth still work, scoped to the anonymous fallback user.
+OpenAPI 3.1 spec is served at `/openapi.json`; Swagger UI at `/docs`; ReDoc at `/redoc`. Phase 8: every route under the `chat` and `ingest` tags **requires** `Authorization: Bearer <clerk-jwt>` — unsigned-in requests get `401`. Only `/health` (and Swagger/ReDoc itself) remains world-readable. The optional `DEV_AUTH_BYPASS=1` env var on the backend re-enables permissive Bearer-as-user-id parsing for ad-hoc smoke testing — see [Authentication (Clerk)](./README.md#authentication-clerk) in the README.
 
 | Method | Path                       | Tag     | Purpose                                                      | Status            |
 |--------|----------------------------|---------|--------------------------------------------------------------|-------------------|
@@ -239,7 +241,7 @@ The Playwright suite (`frontend/e2e/`) runs against the live Next.js dev server 
 
 | Concern                    | Will live in                                          |
 |---------------------------- |-------------------------------------------------------|
-| Real authentication (JWT / OAuth) | swap `app/auth.py::get_user_id` for a JWT-verifying dependency returning the `users.id` from a future `users` table. Lightweight session scoping is already in place. |
+| Per-user document ownership in Postgres | add `documents.user_id` (the Clerk user id) and filter retrieval by it, so users can't read each other's ingested corpus. Phase 8 gates the ingest endpoints behind auth but the corpus itself is still shared. |
 | Gemini cost / quota guardrails | rate-limit middleware + per-session token-spend tracking in Redis |
 | Embedding on GPU / MPS     | sentence-transformers picks up MPS automatically on Apple Silicon, but no fallback path / batch tuning yet |
 | Prompt-eval suite          | offline evaluation harness for Tutor citation accuracy and Quiz format compliance |
@@ -247,8 +249,6 @@ The Playwright suite (`frontend/e2e/`) runs against the live Next.js dev server 
 | Grading + difficulty adaptation | `agents/quiz.py` mutating `state.user_score`; persisted per-session |
 | Background ingestion       | move `ingest_parsed` behind a Redis-backed worker (Arq) |
 | Multi-page scraping        | honour `ScrapeRequest.max_depth` (currently ignored)  |
-| Database migrations        | `backend/migrations/` (Alembic)                       |
-| Authenticated session ownership | `Authorization` header → server-side user_id → session keys keyed by user. Currently any holder of a session UUID can resume that conversation. |
 | CI                         | `.github/workflows/`                                  |
 
 Each of these slots in without restructuring; the skeleton is designed to be additive.

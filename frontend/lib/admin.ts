@@ -9,6 +9,7 @@ export type IngestStatus = {
 };
 
 export type UploadProgress = (loaded: number, total: number) => void;
+export type GetToken = () => Promise<string | null>;
 
 const INGEST_UPLOAD_URL = "/api/backend/ingest/upload";
 const INGEST_SCRAPE_URL = "/api/backend/ingest/scrape";
@@ -16,11 +17,13 @@ const INGEST_SCRAPE_URL = "/api/backend/ingest/scrape";
 // We use XMLHttpRequest (not fetch) because `xhr.upload.onprogress` is the only
 // browser API that exposes byte-level upload progress. The route's response is
 // a normal JSON IngestStatus, not SSE.
-export function uploadFile(
+export async function uploadFile(
   file: File,
   title: string | null,
   onProgress?: UploadProgress,
+  getToken?: GetToken,
 ): Promise<IngestStatus> {
+  const token = getToken ? await getToken() : null;
   return new Promise((resolve, reject) => {
     const form = new FormData();
     form.append("file", file);
@@ -28,6 +31,7 @@ export function uploadFile(
 
     const xhr = new XMLHttpRequest();
     xhr.open("POST", INGEST_UPLOAD_URL);
+    if (token) xhr.setRequestHeader("Authorization", `Bearer ${token}`);
 
     if (onProgress) {
       xhr.upload.onprogress = (e) => {
@@ -60,10 +64,14 @@ export function uploadFile(
   });
 }
 
-export async function scrapeUrl(url: string): Promise<IngestStatus> {
+export async function scrapeUrl(url: string, getToken?: GetToken): Promise<IngestStatus> {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  const token = getToken ? await getToken() : null;
+  if (token) headers.Authorization = `Bearer ${token}`;
+
   const res = await fetch(INGEST_SCRAPE_URL, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers,
     body: JSON.stringify({ url }),
   });
   if (!res.ok) {

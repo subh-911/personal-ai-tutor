@@ -4,10 +4,12 @@ import { useState, type FormEvent } from "react";
 import { toast } from "sonner";
 
 import { scrapeUrl } from "@/lib/admin";
+import { useBackendToken } from "@/lib/auth-token";
 
 export function ScrapeForm() {
   const [url, setUrl] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const getToken = useBackendToken();
 
   const onSubmit = async (e: FormEvent) => {
     e.preventDefault();
@@ -17,7 +19,7 @@ export function ScrapeForm() {
     setSubmitting(true);
     const toastId = toast.loading(`Scraping ${trimmed}…`);
     try {
-      const result = await scrapeUrl(trimmed);
+      const result = await scrapeUrl(trimmed, getToken);
       toast.success(
         `Scraped "${result.title ?? trimmed}" — ${result.chunk_count} chunk${
           result.chunk_count === 1 ? "" : "s"

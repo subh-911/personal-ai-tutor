@@ -64,7 +64,7 @@ def _to_lc_messages(messages: list[ChatMessage]) -> list[BaseMessage]:
 async def _token_stream(
     *,
     request: ChatRequest,
-    user_id: UUID,
+    user_id: str,
     session_id: UUID,
     store: SessionStore,
 ) -> AsyncIterator[bytes]:
@@ -153,7 +153,7 @@ def _summarise_error(exc: BaseException) -> str:
 )
 async def chat(
     request: ChatRequest,
-    user_id: UUID = Depends(get_user_id),
+    user_id: str = Depends(get_user_id),
 ) -> StreamingResponse:
     store = get_session_store()
     session_id = request.session_id or uuid4()
