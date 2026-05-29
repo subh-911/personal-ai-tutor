@@ -1,9 +1,16 @@
-import Link from "next/link";
+"use client";
 
+import Link from "next/link";
+import { useCallback, useState } from "react";
+
+import { DocumentsTable } from "@/components/admin/DocumentsTable";
 import { ScrapeForm } from "@/components/admin/ScrapeForm";
 import { UploadZone } from "@/components/admin/UploadZone";
 
 export default function AdminPage() {
+  const [refreshKey, setRefreshKey] = useState(0);
+  const onIngested = useCallback(() => setRefreshKey((k) => k + 1), []);
+
   return (
     <main
       className="mx-auto flex min-h-screen max-w-5xl flex-col gap-6 p-6"
@@ -25,9 +32,11 @@ export default function AdminPage() {
       </header>
 
       <div className="grid gap-6 md:grid-cols-2">
-        <UploadZone />
-        <ScrapeForm />
+        <UploadZone onIngested={onIngested} />
+        <ScrapeForm onIngested={onIngested} />
       </div>
+
+      <DocumentsTable refreshKey={refreshKey} />
     </main>
   );
 }

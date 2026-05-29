@@ -1,8 +1,15 @@
+from pathlib import Path
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Anchor env_file to the project root so values load regardless of which
+# directory the process is started from (e.g. `cd backend && uvicorn ...`).
+# This file lives at backend/app/config.py — project root is two parents up.
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(env_file=str(_PROJECT_ROOT / ".env"), extra="ignore")
 
     database_url: str = "postgresql+asyncpg://tutor:tutor@localhost:5432/tutor"
     redis_url: str = "redis://localhost:6380/0"

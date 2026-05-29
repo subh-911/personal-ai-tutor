@@ -5,6 +5,7 @@ from uuid import UUID, uuid4
 
 import pytest
 import pytest_asyncio
+from fastapi import Header
 from fpdf import FPDF
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import text
@@ -18,13 +19,19 @@ from app.services.embeddings import get_embedding_provider
 from app.services.session import SESSION_KEY_PREFIX
 
 
-async def _test_get_user_id(authorization: str | None = None) -> str:
+async def _test_get_user_id(authorization: str | None = Header(default=None)) -> str:
     """Phase 8 test override: mirrors the pre-phase-8 permissive parser.
 
     Returns the Bearer value verbatim when present; falls back to
     `ANONYMOUS_USER_ID` when absent or malformed. Keeps the existing test
     semantics (sending different Bearer tokens → different user namespaces)
     without requiring the suite to mint or verify real Clerk JWTs.
+
+    NOTE: the `Header(...)` default is load-bearing — FastAPI's dependency
+    overrides are themselves re-resolved as dependencies, so the parameter must
+    declare its header source the same way `app.auth.get_user_id` does. Without
+    it, FastAPI treats `authorization` as a query parameter, never injects the
+    request header, and the override silently always returns ANONYMOUS_USER_ID.
     """
     if not authorization:
         return ANONYMOUS_USER_ID
@@ -189,6 +196,7 @@ async def seeded_chunks(db_clean) -> dict[str, UUID | list[UUID]]:
     async with async_session_maker() as session:
         document = Document(
             id=document_id,
+            user_id=ANONYMOUS_USER_ID,
             source_type="upload",
             source_uri="phase2-seed.txt",
             title="Phase 2 seed corpus",

@@ -26,8 +26,10 @@ async def ingest_parsed(
     source_type: SourceType,
     source_uri: str,
     title: str | None,
+    user_id: str | None = None,
 ) -> Document:
     document = Document(
+        user_id=user_id,
         source_type=source_type,
         source_uri=source_uri,
         title=title or parsed.title,
@@ -68,6 +70,7 @@ async def ingest_parsed(
         if failed is None:
             failed = Document(
                 id=document.id,
+                user_id=user_id,
                 source_type=source_type,
                 source_uri=source_uri,
                 title=title or parsed.title,

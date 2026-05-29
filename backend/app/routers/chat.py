@@ -11,6 +11,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 
 from app.agents.graph import graph
 from app.auth import get_user_id
+from app.config import settings
 from app.schemas.chat import ChatMessage, ChatRequest
 from app.services.session import SessionStore, get_session_store
 
@@ -43,9 +44,9 @@ data: [DONE]
 ```
 
 Tokens are streamed live from `gemini-2.5-flash` via LangGraph's
-`astream_events(version="v2")`. Only chunks produced by the `tutor` and `quiz`
-nodes are forwarded; the Router's classifier output is filtered out so its
-single-word route decision never leaks into the assistant response.
+`astream_events(version="v2")`. Only chunks produced by the `tutor`, `quiz`, and
+`smalltalk` nodes are forwarded; the Router's classifier output is filtered out
+so its single-word route decision never leaks into the assistant response.
 """
 
 
@@ -87,7 +88,7 @@ async def _token_stream(
                 continue
             metadata = event.get("metadata") or {}
             node = metadata.get("langgraph_node")
-            if node not in ("tutor", "quiz"):
+            if node not in ("tutor", "quiz", "smalltalk"):
                 continue
             chunk = (event.get("data") or {}).get("chunk")
             text = getattr(chunk, "content", None) if chunk is not None else None
@@ -120,10 +121,17 @@ def _summarise_error(exc: BaseException) -> str:
     msg = str(exc)
     low = msg.lower()
     if "resource_exhausted" in low or "quota" in low or "429" in msg:
+        # The Gemini free tier caps `gemini-2.5-flash` AND `gemini-2.5-flash-lite`
+        # at 20 requests/day each. Each chat turn costs at least 2 requests
+        # (router classifier + node), so the 20/day budget covers ~10 turns.
+        model = settings.gemini_model_name
         return (
-            "The LLM is rate-limited (Gemini free tier: 20 requests / day for gemini-2.5-flash). "
-            "Wait for the daily window to reset, enable billing on the Google AI Studio project, "
-            "or switch to a different model (e.g. gemini-2.5-flash-lite) in backend/app/config.py."
+            f"The Gemini API is rate-limiting requests for model `{model}` "
+            "(free tier: 20 requests / day, per-minute caps too). Options: wait for "
+            "the daily window to reset (resets midnight Pacific), enable billing on "
+            "the Google AI Studio project for the same key, or set a different "
+            "GOOGLE_API_KEY in `.env` from a separate AI Studio project to get a "
+            "fresh daily quota."
         )
     if "api key" in low or "permission" in low or "401" in msg or "403" in msg:
         return "The LLM rejected the request (auth/permission). Check GOOGLE_API_KEY in .env."

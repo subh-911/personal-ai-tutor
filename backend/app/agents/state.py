@@ -8,7 +8,7 @@ from langgraph.graph.message import add_messages
 from app.services.retrieval import RetrievedChunk
 
 
-Route = Literal["tutor", "quiz"]
+Route = Literal["tutor", "quiz", "smalltalk"]
 
 
 class TutorState(TypedDict, total=False):

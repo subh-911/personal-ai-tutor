@@ -66,6 +66,7 @@ async def upload_document(
         source_type="upload",
         source_uri=file.filename or "uploaded",
         title=title,
+        user_id=user_id,
     )
     return await _to_status(session, document)
 
@@ -96,6 +97,7 @@ async def scrape_url(
         source_type="scrape",
         source_uri=final_url,
         title=None,
+        user_id=user_id,
     )
     return await _to_status(session, document)
 
@@ -111,7 +113,16 @@ async def get_ingestion_status(
     session: AsyncSession = Depends(get_session),
     user_id: str = Depends(get_user_id),
 ) -> IngestStatus:
-    document = await session.get(Document, ingestion_id)
+    # Phase 9: status polls succeed for the caller's own ingests, plus legacy
+    # rows uploaded before per-user ownership existed (`user_id IS NULL`). A
+    # caller polling another user's owned doc id gets 404 — collapsing 403 into
+    # 404 so existence is not leaked across users.
+    document = await session.scalar(
+        select(Document).where(
+            Document.id == ingestion_id,
+            (Document.user_id == user_id) | (Document.user_id.is_(None)),
+        )
+    )
     if document is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "ingestion not found")
     return await _to_status(session, document)

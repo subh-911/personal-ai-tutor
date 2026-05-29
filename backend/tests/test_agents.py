@@ -33,6 +33,27 @@ async def test_router_sends_quiz_request_to_quiz() -> None:
         assert letter in response, f"quiz response missing option {letter!r}"
 
 
+async def test_router_sends_greeting_to_smalltalk() -> None:
+    state = await ainvoke_graph("Hi")
+
+    assert state["route"] == "smalltalk"
+    response = (state["response"] or "").strip()
+    assert response, "smalltalk node must produce a response"
+    # The Tutor's strict-grounding refusal sentence must NOT appear here —
+    # that wording is reserved for substantive un-grounded questions.
+    assert "I don't have enough information" not in response
+
+
+async def test_smalltalk_skips_retrieval(seeded_chunks) -> None:
+    # The seeded corpus would let the Tutor retrieve real chunks; smalltalk should
+    # not invoke retrieval at all. We verify by checking that `state["context"]`
+    # remains empty after a greeting, even with retrievable material in the DB.
+    state = await ainvoke_graph("Hello there!")
+
+    assert state["route"] == "smalltalk"
+    assert state.get("context") == [], "smalltalk node must not invoke retrieval"
+
+
 async def test_tutor_retrieves_from_pgvector(seeded_chunks) -> None:
     state = await ainvoke_graph("Explain the CAP theorem and partition tolerance.")
 

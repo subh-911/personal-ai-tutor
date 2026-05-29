@@ -10,7 +10,7 @@ def make_router_node(llm: LLMProvider | None = None):
     provider = llm or get_llm_provider()
 
     async def router_node(state: TutorState) -> TutorState:
-        if state.get("route") in ("tutor", "quiz"):
+        if state.get("route") in ("tutor", "quiz", "smalltalk"):
             return {}
         last_user = next(
             (m for m in reversed(state.get("messages", [])) if isinstance(m, HumanMessage)),
