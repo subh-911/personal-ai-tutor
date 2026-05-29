@@ -4,6 +4,7 @@ import { useCallback, useRef, useState, type DragEvent, type ChangeEvent } from 
 import { toast } from "sonner";
 
 import { uploadFile, type IngestStatus } from "@/lib/admin";
+import { useBackendToken } from "@/lib/auth-token";
 
 type UploadStatus = "pending" | "uploading" | "done" | "error";
 
@@ -44,6 +45,7 @@ export function UploadZone() {
   const [items, setItems] = useState<UploadItem[]>([]);
   const [dragOver, setDragOver] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
+  const getToken = useBackendToken();
 
   const startUpload = useCallback(async (file: File) => {
     const id = makeId();
@@ -58,9 +60,14 @@ export function UploadZone() {
     update({ status: "uploading" });
 
     try {
-      const result = await uploadFile(file, null, (loaded, total) => {
-        update({ progress: total > 0 ? loaded / total : 0 });
-      });
+      const result = await uploadFile(
+        file,
+        null,
+        (loaded, total) => {
+          update({ progress: total > 0 ? loaded / total : 0 });
+        },
+        getToken,
+      );
       update({ status: "done", progress: 1, result });
       toast.success(
         `Ingested "${file.name}" — ${result.chunk_count} chunk${result.chunk_count === 1 ? "" : "s"}`,
@@ -70,7 +77,7 @@ export function UploadZone() {
       update({ status: "error", error: message });
       toast.error(`Upload failed for "${file.name}": ${message}`);
     }
-  }, []);
+  }, [getToken]);
 
   const handleFiles = useCallback(
     (files: FileList | File[]) => {

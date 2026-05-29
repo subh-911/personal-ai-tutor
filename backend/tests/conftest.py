@@ -9,12 +9,29 @@ from fpdf import FPDF
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import text
 
+from app.auth import ANONYMOUS_USER_ID, get_user_id
 from app.db import async_session_maker, engine
 from app.main import app
 from app.models import Base, Document, DocumentChunk
 from app.redis_client import redis as redis_client
 from app.services.embeddings import get_embedding_provider
 from app.services.session import SESSION_KEY_PREFIX
+
+
+async def _test_get_user_id(authorization: str | None = None) -> str:
+    """Phase 8 test override: mirrors the pre-phase-8 permissive parser.
+
+    Returns the Bearer value verbatim when present; falls back to
+    `ANONYMOUS_USER_ID` when absent or malformed. Keeps the existing test
+    semantics (sending different Bearer tokens → different user namespaces)
+    without requiring the suite to mint or verify real Clerk JWTs.
+    """
+    if not authorization:
+        return ANONYMOUS_USER_ID
+    scheme, _, value = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not value.strip():
+        return ANONYMOUS_USER_ID
+    return value.strip()
 
 
 def pytest_configure(config: pytest.Config) -> None:
@@ -36,12 +53,23 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
 
 @pytest_asyncio.fixture(scope="session", autouse=True)
 async def _create_schema() -> AsyncIterator[None]:
-    from app.main import HNSW_INDEX_SQL
-
+    # Tests build tables from scratch each session; the model-declared HNSW
+    # `Index(...)` materialises natively at table-create time, so we don't need
+    # to reissue the DDL ourselves. Production schema is owned by Alembic.
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-        await conn.execute(HNSW_INDEX_SQL)
     yield
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _override_auth():
+    # Phase 8: production `get_user_id` requires a verified Clerk JWT. Tests
+    # don't have one — they install a permissive override that mirrors the
+    # pre-phase-8 behaviour so existing assertions (Bearer-as-user-id, missing
+    # header → anonymous) continue to hold without minting real tokens.
+    app.dependency_overrides[get_user_id] = _test_get_user_id
+    yield
+    app.dependency_overrides.pop(get_user_id, None)
 
 
 @pytest_asyncio.fixture(scope="session", autouse=True)

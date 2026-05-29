@@ -295,7 +295,7 @@ EXEC
 **Verified live:**
 
 ```text
-$ redis-cli -h 127.0.0.1 -p 6379 KEYS 'chat:user:dddddddd*'
+$ redis-cli -h 127.0.0.1 -p 6380 KEYS 'chat:user:dddddddd*'   # Docker Redis (phase 7: host 6380)
 chat:user:dddddddd-dddd-dddd-dddd-dddddddddddd:session:e8b57896-b9c0-41ed-96c4-d08c692bab0e:messages
 
 $ redis-cli LRANGE … 0 -1
@@ -344,10 +344,12 @@ The error is also persisted to Redis as part of the assistant turn — surfaces 
 
 ## 5. Operational notes
 
-- **Two Redis instances on port 6379**: there's a native macOS Redis (PID 4373 on `127.0.0.1:6379`) AND the Docker container `tutor-redis` (also bound to 6379). The native one wins for `127.0.0.1` traffic, so the app talks to it. The Docker Redis is idle. Production deployments shouldn't have this duplication — use *only* the compose container. To confirm where data lives: `lsof -nP -iTCP:6379 -sTCP:LISTEN`.
+- **Two Redis instances on port 6379** *(Resolved in Phase 7)*: there used to be a native macOS Redis (PID 4373 on `127.0.0.1:6379`) competing with the Docker container `tutor-redis` (also bound to 6379) — the native one won for `127.0.0.1` traffic, so the app silently talked to it while Docker Redis sat idle. **Phase 7** moves the container's host mapping to `6380:6379`, so the app now reliably talks to Docker Redis. To inspect Docker Redis from the host, use `redis-cli -p 6380` (or `docker exec tutor-redis redis-cli` for the in-container path). The native `redis-server`, if installed, keeps 6379 to itself — no longer a conflict. If you want to eliminate it entirely: `brew services stop redis`.
 - **Default model is `gemini-2.5-flash-lite`** (`app/config.py::gemini_model_name`) — chosen for a fresh free-tier daily quota bucket. Switch back to `gemini-2.5-flash` for slightly higher quality once billing is enabled.
 - **HuggingFace model lives in `~/.cache/huggingface/`** (~420 MB). The session-scoped `_hf_warmup` test fixture absorbs the first-load cost once per test run.
-- **HNSW index is created idempotently** on every backend boot via a `CREATE INDEX IF NOT EXISTS` in `app/main.py`'s lifespan — survives container recreates without needing migrations.
+- **Schema is owned by Alembic** *(Phase 7)*: tables, FK, unique constraint, and the HNSW ANN index are all created by `backend/alembic/versions/0001_baseline.py`. Run `alembic upgrade head` against a fresh DB; for an already-populated DB, `alembic stamp head` records the baseline without re-issuing DDL. The lifespan no longer touches schema.
+- **Auth in dev vs prod** *(Phase 8)*: by default the backend requires a Clerk-signed JWT on every `/chat` and `/ingest/*` request — unauthenticated requests get `401`. For local curl smoke testing, set `DEV_AUTH_BYPASS=1` in `.env` to fall back to the pre-Phase-8 permissive Bearer parser (any token value accepted verbatim as the user id; missing header → fixed anonymous string). A `WARNING` is logged on boot whenever bypass is on so it can't slip into production unnoticed. The Playwright suite uses this same flag, plus a parallel `NEXT_PUBLIC_TEST_DISABLE_AUTH=1` on the frontend that skips `ClerkProvider` and the `clerkMiddleware`, so the e2e tests run hermetically without real Clerk credentials.
+- **Redis key shape after Phase 8**: `chat:user:user_2abc123def:session:<uuid>:messages` — the `user_xxx` segment is now a verified Clerk user id string. Pre-Phase-8 anonymous-UUID keys (`chat:user:00000000-…`) are orphaned and retire via the 30-day TTL.
 - **Action buttons bypass the Router's LLM call** by sending `force_route: "tutor" | "quiz"` in the request body. The router node short-circuits when `state["route"]` is already set — saves a Gemini call and gives the user deterministic routing for the "Give me an example" / "Test my knowledge" affordances.
 
 ---
@@ -355,12 +357,13 @@ The error is also persisted to Redis as part of the assistant turn — surfaces 
 ## 6. How to demo this to someone
 
 1. `docker compose up -d` (or confirm it's running)
-2. `cd backend && uv run uvicorn app.main:app --reload`
-3. `cd frontend && npm run dev`
-4. Open <http://localhost:3000>.
-5. Click **Admin · ingestion** → drag a PDF or paste a URL of a system-design article → wait for the green toast with the chunk count.
+2. `cd backend && uv run alembic upgrade head && uv run uvicorn app.main:app --reload` *(Phase 8 — backend reads `CLERK_JWKS_URL` + `CLERK_ISSUER` from `.env`; without them, all `/chat` and `/ingest/*` requests return 401)*
+3. `cd frontend && npm run dev` *(needs `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` + `CLERK_SECRET_KEY` in `.env.local`)*
+4. Open <http://localhost:3000>. **Sign up** via the Clerk-hosted flow on the landing page; afterwards the chat / admin links appear.
+5. Click **Admin · ingestion** → drag a PDF or paste a URL of a system-design article → wait for the green toast with the chunk count. *(Backend verifies the Clerk JWT before accepting the upload.)*
 6. Click **← Back to chat** (or open `/chat`).
 7. Type a grounded question (e.g. *"Summarise the key design choices."*) — watch tokens land.
 8. Type something outside the corpus (e.g. *"Explain WhatsApp architecture"* when you only uploaded Amazon docs) — watch the Tutor refuse with the literal fallback sentence.
 9. Click **Test my knowledge** with the chat input filled — watch a structured MCQ stream in.
-10. Reload the page — your conversation is back (resumed from Redis via the `localStorage` session id).
+10. Reload the page — your conversation is back (resumed from Redis via the `localStorage` session id + the Clerk session cookie).
+11. In another shell, `docker exec tutor-redis redis-cli --scan --pattern 'chat:user:user_*'` — you'll see one `chat:user:user_<your-clerk-id>:session:<uuid>:messages` key per conversation. Different Clerk users get separate namespaces.

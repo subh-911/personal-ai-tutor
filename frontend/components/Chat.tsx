@@ -7,6 +7,7 @@ import {
   type ForceRoute,
   type Message,
 } from "@/lib/api";
+import { useBackendToken } from "@/lib/auth-token";
 import { streamChat } from "@/lib/sse";
 
 import { ChatInput } from "./ChatInput";
@@ -21,6 +22,7 @@ export function Chat() {
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [streaming, setStreaming] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const getToken = useBackendToken();
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -47,11 +49,15 @@ export function Chat() {
       setStreaming(true);
 
       try {
-        for await (const event of streamChat({
-          message: text,
-          session_id: sessionId ?? undefined,
-          force_route: forceRoute,
-        })) {
+        for await (const event of streamChat(
+          {
+            message: text,
+            session_id: sessionId ?? undefined,
+            force_route: forceRoute,
+          },
+          undefined,
+          getToken,
+        )) {
           if (event.kind === "session") {
             setSessionId(event.sessionId);
           } else if (event.kind === "delta") {
@@ -74,7 +80,7 @@ export function Chat() {
         setStreaming(false);
       }
     },
-    [sessionId],
+    [sessionId, getToken],
   );
 
   return (

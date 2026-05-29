@@ -10,8 +10,10 @@ from app.schemas.chat import ChatMessage
 
 
 # Phase 6: keys are namespaced by user id so a leaked session UUID alone can't
-# unlock another user's history. Old phase-3 `chat:session:*` keys are not
-# migrated; the rolling 30-day TTL retires them naturally.
+# unlock another user's history. Phase 8: user_id is now a verified Clerk user
+# id string (e.g. `user_2abc123def`) rather than a UUID — the key shape is
+# unchanged. Pre-phase-8 anonymous-UUID keys are abandoned; the 30-day TTL
+# retires them naturally.
 SESSION_KEY_PREFIX = "chat:user:"
 
 
@@ -29,16 +31,16 @@ class SessionStore:
         self.max_messages = max_messages
         self.ttl_seconds = ttl_seconds
 
-    def _key(self, user_id: UUID, session_id: UUID) -> str:
+    def _key(self, user_id: str, session_id: UUID) -> str:
         return f"{SESSION_KEY_PREFIX}{user_id}:session:{session_id}:messages"
 
-    async def get_history(self, user_id: UUID, session_id: UUID) -> list[ChatMessage]:
+    async def get_history(self, user_id: str, session_id: UUID) -> list[ChatMessage]:
         items = await self.redis.lrange(self._key(user_id, session_id), 0, -1)
         return [ChatMessage.model_validate_json(item) for item in items]
 
     async def append_turn(
         self,
-        user_id: UUID,
+        user_id: str,
         session_id: UUID,
         *,
         user_msg: ChatMessage,
@@ -51,7 +53,7 @@ class SessionStore:
             pipe.expire(key, self.ttl_seconds)
             await pipe.execute()
 
-    async def clear(self, user_id: UUID, session_id: UUID) -> None:
+    async def clear(self, user_id: str, session_id: UUID) -> None:
         await self.redis.delete(self._key(user_id, session_id))
 
 

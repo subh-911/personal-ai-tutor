@@ -23,6 +23,8 @@ dependencies = [
     "langchain-core>=0.3",
     "langchain-google-genai>=2.0",
     "sentence-transformers>=2.7.0",
+    "alembic>=1.13",
+    "pyjwt[crypto]>=2.9",
 ]
 
 [dependency-groups]

@@ -16,8 +16,36 @@ See [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the full design, [`DIAGRAMS.md`](
 ```bash
 git clone <this repo>
 cd personal-ai-tutor
-cp .env.example .env
-docker compose up -d            # starts Postgres+pgvector and Redis
+cp .env.example .env            # see "Redis port" note below if you already had a .env
+docker compose up -d            # starts Postgres+pgvector (5432) and Redis (host 6380)
+```
+
+> **Redis port (phase 7).** The Docker container exposes Redis on host port **`6380`** (mapped to the container's `6379` internally). This avoids collision with any native macOS `redis-server` running on `6379` — historically that native instance silently shadowed the container and chat data was written to the wrong Redis. If you have a pre-existing `.env` from before phase 7, **regenerate it** from `.env.example` so `REDIS_URL` points at `localhost:6380`.
+
+## Database migrations
+
+Schema is owned by **Alembic** (`backend/alembic/`). The lifespan no longer creates tables — `alembic upgrade head` is required before booting against a fresh database.
+
+```bash
+cd backend
+uv sync
+uv run alembic upgrade head     # fresh database → creates documents, document_chunks, HNSW index
+```
+
+If you already have a populated database from phase 6 (with `documents` / `document_chunks` already present), **stamp** it at the baseline instead — non-destructive, just records the current revision so future migrations apply on top:
+
+```bash
+uv run alembic stamp head
+```
+
+Validate the migration applies cleanly to an empty DB at any time:
+
+```bash
+docker exec tutor-postgres psql -U tutor -d postgres -c "CREATE DATABASE tutor_migration_test"
+DATABASE_URL="postgresql+asyncpg://tutor:tutor@localhost:5432/tutor_migration_test" \
+  uv run alembic upgrade head
+docker exec tutor-postgres psql -U tutor -d tutor_migration_test -c "\d document_chunks"
+docker exec tutor-postgres psql -U tutor -d postgres -c "DROP DATABASE tutor_migration_test"
 ```
 
 ## Run the stack (three terminals)
@@ -27,6 +55,7 @@ docker compose up -d            # starts Postgres+pgvector and Redis
 ```bash
 cd backend
 uv sync
+uv run alembic upgrade head     # idempotent; safe to re-run
 uv run uvicorn app.main:app --reload
 ```
 
@@ -69,9 +98,29 @@ curl -X POST http://localhost:8000/ingest/scrape \
      -d '{"url": "https://example.com/article"}'
 ```
 
-## Authentication (lightweight)
+## Authentication (Clerk)
 
-`/chat` accepts an optional `Authorization: Bearer <user-uuid>` header. The value is used to namespace Redis session keys (`chat:user:<user-uuid>:session:<session-uuid>:messages`) so a leaked session id alone can't read another user's history. Requests without a header fall back to a fixed anonymous user UUID — fine for single-user local dev. Real auth (JWT/OAuth) slots in by replacing the `app/auth.py::get_user_id` dependency.
+Phase 8 wires real identity in front of the API. The frontend uses **Clerk** for sign-in / sign-up; the backend verifies the Clerk-issued JWT against Clerk's published JWKS on every `/chat` and `/ingest/*` request. Requests without a valid token receive `401 Unauthorized`.
+
+**Setup**
+
+1. Create a Clerk application at <https://dashboard.clerk.com>.
+2. Frontend keys — copy `.env.local.example` to `.env.local` in `frontend/` and fill:
+   - `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` (from Clerk → API Keys)
+   - `CLERK_SECRET_KEY` (same page)
+3. Backend keys — in the root `.env`, fill:
+   - `CLERK_JWKS_URL` — your application's JWKS endpoint, typically `https://<your-frontend-api>.clerk.accounts.dev/.well-known/jwks.json`
+   - `CLERK_ISSUER` — your application's Frontend API URL, typically `https://<your-frontend-api>.clerk.accounts.dev`
+
+**Behaviour**
+
+- Unsigned-in visitors hitting `/chat` or `/admin` are redirected to `/sign-in`. The Clerk-hosted flow handles email/password, OAuth, MFA, etc.
+- Authenticated requests carry `Authorization: Bearer <jwt>`. The backend's `get_user_id` dependency verifies the signature (RS256, JWKS-cached), checks issuer + expiry, and extracts the `sub` claim — a Clerk user id like `user_2abc123def`.
+- Session memory is keyed by the *verified* user id: `chat:user:user_2abc123def:session:<uuid>:messages`. Two callers presenting different JWTs but sharing a session UUID get completely separate Redis namespaces.
+
+**Dev escape hatch: `DEV_AUTH_BYPASS=1`**
+
+For backend-only smoke testing (curl, agent tests outside the full stack), set `DEV_AUTH_BYPASS=1` in `.env`. The auth dependency reverts to permissive Bearer-as-user-id parsing — any Bearer value is accepted verbatim as the user id, and missing headers fall back to a fixed anonymous string. The backend logs a `WARNING` on boot whenever bypass is enabled. **Never set this in production.** The Playwright e2e suite (`npm run test:e2e`) uses this flag automatically via `playwright.config.ts` so the hermetic test environment doesn't need real Clerk credentials.
 
 ## Tests
 
@@ -92,7 +141,7 @@ npx playwright install chromium    # one-time
 npm run test:e2e
 ```
 
-Drives a real browser against the live stack. The chat specs mock the SSE stream and the admin specs mock the ingestion responses, so the suite is independent of LLM quota / network reach.
+Drives a real browser against the live stack. The chat specs mock the SSE stream and the admin specs mock the ingestion responses, so the suite is independent of LLM quota / network reach. Phase 8: Playwright launches both servers with auth bypass (`DEV_AUTH_BYPASS=1` on the backend, `NEXT_PUBLIC_TEST_DISABLE_AUTH=1` on the frontend) so no real Clerk credentials are needed for the test suite.
 
 ## Reset state
 

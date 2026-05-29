@@ -23,7 +23,10 @@ services:
     container_name: tutor-redis
     restart: unless-stopped
     ports:
-      - "6379:6379"
+      # Host port 6380 to avoid collision with a native macOS redis-server
+      # (which historically shadowed this container on 6379 during phase 6
+      # debugging — see end-to-end-flow.md §operational notes).
+      - "6380:6379"
     volumes:
       - redisdata:/data
     healthcheck:

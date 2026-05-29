@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, s
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.auth import get_user_id
 from app.config import settings
 from app.db import get_session
 from app.models import Document, DocumentChunk
@@ -48,6 +49,7 @@ async def upload_document(
     file: UploadFile = File(..., description="Document to ingest."),
     title: str | None = Form(None, description="Optional human-readable title; defaults to the filename or PDF metadata."),
     session: AsyncSession = Depends(get_session),
+    user_id: str = Depends(get_user_id),
 ) -> IngestStatus:
     data = await file.read()
     if len(data) > settings.max_upload_bytes:
@@ -80,6 +82,7 @@ async def upload_document(
 async def scrape_url(
     payload: ScrapeRequest,
     session: AsyncSession = Depends(get_session),
+    user_id: str = Depends(get_user_id),
 ) -> IngestStatus:
     try:
         html, final_url = await fetch_url(str(payload.url))
@@ -106,6 +109,7 @@ async def scrape_url(
 async def get_ingestion_status(
     ingestion_id: UUID,
     session: AsyncSession = Depends(get_session),
+    user_id: str = Depends(get_user_id),
 ) -> IngestStatus:
     document = await session.get(Document, ingestion_id)
     if document is None:
