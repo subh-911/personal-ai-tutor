@@ -41,7 +41,11 @@ function formatBytes(n: number): string {
   return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-export function UploadZone() {
+type UploadZoneProps = {
+  onIngested?: () => void;
+};
+
+export function UploadZone({ onIngested }: UploadZoneProps = {}) {
   const [items, setItems] = useState<UploadItem[]>([]);
   const [dragOver, setDragOver] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -72,12 +76,13 @@ export function UploadZone() {
       toast.success(
         `Ingested "${file.name}" — ${result.chunk_count} chunk${result.chunk_count === 1 ? "" : "s"}`,
       );
+      onIngested?.();
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       update({ status: "error", error: message });
       toast.error(`Upload failed for "${file.name}": ${message}`);
     }
-  }, [getToken]);
+  }, [getToken, onIngested]);
 
   const handleFiles = useCallback(
     (files: FileList | File[]) => {

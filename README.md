@@ -24,7 +24,7 @@ docker compose up -d            # starts Postgres+pgvector (5432) and Redis (hos
 
 ## Database migrations
 
-Schema is owned by **Alembic** (`backend/alembic/`). The lifespan no longer creates tables — `alembic upgrade head` is required before booting against a fresh database.
+Schema is owned by **Alembic** (`backend/alembic/`). The lifespan no longer creates tables — `alembic upgrade head` is required before booting against a fresh database. The current head is `0002_add_user_id_to_documents` (phase 9), which adds the nullable `documents.user_id` column + a b-tree index for the per-user document list.
 
 ```bash
 cd backend
@@ -83,6 +83,27 @@ There's a small Admin · Ingestion page for feeding documents into the corpus wi
 3. **Scrape a URL** — paste a public article URL (e.g. a system-design write-up) and click **Scrape**. The backend fetches the page, extracts the main text via BeautifulSoup, and runs the full ingestion pipeline. A success or error toast appears when the call returns.
 
 Both flows talk to the existing `POST /ingest/upload` and `POST /ingest/scrape` endpoints; nothing else is required.
+
+### Knowledge base management
+
+Phase 9 added a **Your knowledge base** table below the upload + scrape cards. It lists everything you've ingested under your Clerk identity — title, source type, chunk count, and date added — sorted most-recent-first. The list auto-refreshes after a successful upload or scrape, and a manual **Refresh** button is available on the card header.
+
+Each row carries a **Delete** action that fires a sonner confirmation toast (Cancel / Delete). Confirming sends `DELETE /documents/{id}` to the backend; the row disappears optimistically and the document's chunks are removed by the existing `ON DELETE CASCADE` on `document_chunks.document_id`. If the delete fails (network, expired JWT), the row is restored and an error toast appears. Dismissing the confirmation toast without choosing does nothing.
+
+**Visibility rules**:
+- You only see documents whose `documents.user_id` matches your verified Clerk user id.
+- Documents ingested before phase 9 carry `user_id IS NULL` (legacy / unowned). They remain in the corpus and are still retrievable by the chat tutor, but they are invisible in this table and cannot be deleted via the UI.
+- Retrieval is still corpus-wide (across users + legacy). Phase 10+ will filter retrieval by `user_id` so the tutor can't ground answers in another user's material.
+
+**Operator escape hatch** for legacy rows — run against the Postgres container:
+
+```sql
+-- Claim legacy rows for a specific user (so they appear in that user's table):
+UPDATE documents SET user_id = 'user_2abc123def' WHERE user_id IS NULL;
+
+-- Or drop them entirely (chunks cascade):
+DELETE FROM documents WHERE user_id IS NULL;
+```
 
 ## Sample data via the API
 

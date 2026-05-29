@@ -55,4 +55,82 @@ test.describe("admin page", () => {
       page.getByText(/scrape failed.*failed to fetch url/i),
     ).toBeVisible({ timeout: 10_000 });
   });
+
+  test("documents table renders the caller's documents from GET /documents", async ({ page }) => {
+    await page.route("**/api/backend/documents", async (route) => {
+      const body = JSON.stringify([
+        {
+          id: "22222222-2222-2222-2222-222222222222",
+          source_type: "scrape",
+          source_uri: "https://example.com/article-a",
+          title: "Article A",
+          status: "completed",
+          chunk_count: 7,
+          created_at: "2026-05-29T10:00:00Z",
+        },
+        {
+          id: "33333333-3333-3333-3333-333333333333",
+          source_type: "upload",
+          source_uri: "notes.pdf",
+          title: "Notes",
+          status: "completed",
+          chunk_count: 14,
+          created_at: "2026-05-28T08:00:00Z",
+        },
+      ]);
+      await route.fulfill({
+        status: 200,
+        headers: { "content-type": "application/json" },
+        body,
+      });
+    });
+
+    await page.goto("/admin");
+    await expect(page.getByTestId("documents-table")).toBeVisible();
+    const rows = page.getByTestId("documents-row");
+    await expect(rows).toHaveCount(2);
+    await expect(page.getByText("Article A")).toBeVisible();
+    await expect(page.getByText("Notes")).toBeVisible();
+  });
+
+  test("deleting a row confirms via sonner and removes it on success", async ({ page }) => {
+    await page.route("**/api/backend/documents", async (route) => {
+      const body = JSON.stringify([
+        {
+          id: "44444444-4444-4444-4444-444444444444",
+          source_type: "upload",
+          source_uri: "notes.pdf",
+          title: "Notes to delete",
+          status: "completed",
+          chunk_count: 3,
+          created_at: "2026-05-29T10:00:00Z",
+        },
+      ]);
+      await route.fulfill({
+        status: 200,
+        headers: { "content-type": "application/json" },
+        body,
+      });
+    });
+    await page.route(
+      "**/api/backend/documents/44444444-4444-4444-4444-444444444444",
+      async (route) => {
+        await route.fulfill({ status: 204, body: "" });
+      },
+    );
+
+    await page.goto("/admin");
+    const row = page.getByTestId("documents-row");
+    await expect(row).toHaveCount(1);
+
+    await page.getByTestId("documents-delete").click();
+
+    // sonner confirmation toast appears with a Delete action.
+    const confirmButton = page.getByRole("button", { name: "Delete", exact: true }).last();
+    await expect(confirmButton).toBeVisible({ timeout: 5_000 });
+    await confirmButton.click();
+
+    await expect(page.getByText(/deleted.*notes to delete/i)).toBeVisible({ timeout: 5_000 });
+    await expect(page.getByTestId("documents-row")).toHaveCount(0);
+  });
 });

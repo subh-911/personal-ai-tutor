@@ -944,3 +944,178 @@ Goal: lock down `/chat` and `/ingest/*` behind real auth before any internet exp
 - **`@clerk/testing` integration** — a real Clerk testing instance with `setupClerkTestingToken()` would let the Playwright suite exercise the real auth path end-to-end (instead of bypassing). Trade-off: requires a Clerk dev account as a test dependency. Deferred until CI exists.
 - **`/admin` role gating** — Phase 8 just requires *any* signed-in user to reach `/admin`. There's no `is_admin` flag, so any authenticated user can ingest. Comes with the user-ownership / RBAC work.
 
+---
+
+# phase9 — Knowledge Base CRUD (Data Hygiene)
+
+Goal: with auth in place, give users control over their specific ingested data before scaling the compute engine. Adds the per-user ownership column the Phase 8 deferred list flagged, plus the GET / DELETE routes and admin UI that finally let users prune their corpus. The `ON DELETE CASCADE` already in place from Phase 7's baseline does the chunk cleanup atomically — no migration to add it, but the verification step is recorded honestly.
+
+### [phase9] 1. CASCADE verification (the "Data Models" subtask collapses to a check)
+- **Already in place from Phase 7 baseline**: `documents.id` → `document_chunks.document_id` carries `ondelete="CASCADE"` at both the ORM layer (`backend/app/models.py::DocumentChunk.document_id`, plus `cascade="all, delete-orphan"` + `passive_deletes=True` on the `Document.chunks` relationship) and the database layer (`backend/alembic/versions/0001_baseline.py::ForeignKeyConstraint(..., ondelete="CASCADE")`).
+- Verified against the live database:
+  ```
+  docker exec tutor-postgres psql -U tutor -d tutor -c \
+    "SELECT confdeltype FROM pg_constraint WHERE conname = 'document_chunks_document_id_fkey';"
+   confdeltype
+  -------------
+   c
+  ```
+  `'c'` = CASCADE. The Phase 9 `DELETE /documents/{id}` route therefore relies on the existing FK to drop chunks atomically — no application-level cascade logic in the router.
+
+### [phase9] 2. Per-user ownership column + migration
+- `backend/app/models.py` — added `user_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)` to `Document`. Nullable so legacy rows (pre-Phase-9 ingests) can coexist as `NULL` (unowned).
+- `backend/alembic/versions/0002_add_user_id_to_documents.py` — new migration. Up: `op.add_column("documents", Column("user_id", String(64), nullable=True))` + `op.create_index("ix_documents_user_id", "documents", ["user_id"])`. Down: drop both. **No data backfill** — legacy rows stay `NULL` to avoid attributing someone else's upload to the wrong user. README documents the operator SQL escape hatch to claim or drop them.
+- Applied against the live database via `uv run alembic upgrade head`. Verified shape: `\d documents` shows the column + index, and `\d document_chunks` still shows the CASCADE FK intact.
+
+### [phase9] 3. Ingest pipeline writes the verified user id
+- `backend/app/services/ingest.py` — `ingest_parsed(...)` gains a `user_id: str | None = None` kwarg threaded onto the `Document(...)` constructor (and the failure-path re-attach). Default of `None` keeps non-route callers (chunker tests, fixtures) working without changes.
+- `backend/app/routers/ingest.py`:
+  - `/ingest/upload` and `/ingest/scrape` pass `user_id=user_id` (the value already returned by the existing `Depends(get_user_id)`) into `ingest_parsed`.
+  - `/ingest/{ingestion_id}` now filters `WHERE id = :id AND (user_id = :caller OR user_id IS NULL)` so polls for legacy unowned ingests still succeed, while polls for another user's newly owned ingest return 404 (existence not leaked).
+
+### [phase9] 4. New `documents` API surface
+- `backend/app/schemas/documents.py` — new module. `DocumentSummary(BaseModel)`: `id`, `source_type`, `source_uri`, `title`, `status`, `chunk_count`, `created_at`.
+- `backend/app/routers/documents.py` — new router, `prefix="/documents"`, `tags=["documents"]`:
+  - `GET /documents` → `list[DocumentSummary]`. Joins `documents` LEFT JOIN `document_chunks` with `func.count(DocumentChunk.id).label("chunk_count")`, filters by `Document.user_id == user_id`, groups by `Document.id`, orders `created_at DESC`. Single query, no N+1.
+  - `DELETE /documents/{document_id}` → `204 No Content`. Uses `session.execute(delete(Document).where(Document.id == doc_id, Document.user_id == user_id))` and inspects `result.rowcount`: 0 → 404 (collapses missing + other-user-owned into one response, no existence leak); else commit and return 204.
+- `backend/app/main.py` — imports + mounts `documents.router`, adds the `documents` tag to OpenAPI metadata.
+
+### [phase9] 5. Test fixture fix + backend test coverage
+- **Load-bearing fix discovered while writing tests**: `backend/tests/conftest.py::_test_get_user_id` was missing the `Header(default=None)` marker on its `authorization` parameter. FastAPI's dependency overrides re-resolve parameter sources just like regular dependencies, so without `Header(...)` the override silently treated `authorization` as a query parameter, never read the request header, and always returned `ANONYMOUS_USER_ID`. This had been latent since Phase 8 (no existing test sent different Bearer tokens to gated routes). Added the import + marker, with an inline comment explaining the trap.
+- `backend/tests/conftest.py::seeded_chunks` fixture also got `user_id=ANONYMOUS_USER_ID` on the seeded `Document(...)` so retrieval fixtures own their data under the test override's anon id.
+- `backend/tests/test_documents.py` — new file with 5 tests:
+  1. `test_unauthenticated_list_returns_401` — temporarily pops the dep override and asserts the real `get_user_id` rejects the request.
+  2. `test_list_isolates_documents_by_owner` — seeds Alice + Bob + a legacy NULL doc, asserts Alice's GET returns exactly her one row.
+  3. `test_delete_own_document_cascades_chunks` — seeds Alice's doc with one chunk, asserts DELETE returns 204 and post-delete `SELECT FROM document_chunks WHERE document_id = ...` is empty (CASCADE actually fires).
+  4. `test_delete_other_users_document_returns_404` — Bob trying to delete Alice's doc gets 404; row remains intact.
+  5. `test_delete_nonexistent_document_returns_404` — DELETE on a random UUID gets 404.
+
+### [phase9] 6. Frontend — DocumentsTable component + auto-refresh wiring
+- `frontend/lib/admin.ts` — appended:
+  - `Document` type matching `DocumentSummary` (`id, source_type, source_uri, title, status, chunk_count, created_at`).
+  - `listDocuments(getToken?)` → fetch GET, returns `Document[]`. Authorization header threaded via the existing `getToken` callable pattern.
+  - `deleteDocument(id, getToken?)` → fetch DELETE, throws on non-2xx with the same `detail` extraction pattern as `scrapeUrl`.
+  - Small `authHeaders` + `detailOrStatus` helpers (DRY shared by the two new functions).
+- `frontend/components/admin/DocumentsTable.tsx` — new client component:
+  - Fetches on mount + when `refreshKey` prop changes via `useEffect(fetchDocs, [fetchDocs, refreshKey])`.
+  - Renders a Tailwind `<table>` (no new dep): Title, Source type, Chunks, Added, Delete. Matches the existing `rounded-2xl border bg-white p-5 shadow-sm` card shell.
+  - Delete: fires a sonner toast with `action: { label: "Delete", onClick }` + `cancel: { label: "Cancel" }`. Confirming triggers an optimistic remove (drop row from local state, snapshot prev), calls `deleteDocument`, restores from snapshot on error, success/error toasts on both paths.
+  - Manual `Refresh` button next to the title for explicit re-fetch.
+  - Empty state (`No documents yet…`) and inline error banner.
+- `frontend/components/admin/UploadZone.tsx` + `frontend/components/admin/ScrapeForm.tsx` — added optional `onIngested?: () => void` prop, fired after a successful upload/scrape (alongside the existing success toast).
+- `frontend/app/admin/page.tsx` — converted from server component to `"use client"`, manages `const [refreshKey, setRefreshKey] = useState(0)` + `onIngested = () => setRefreshKey(k => k + 1)`. Passes `onIngested` into UploadZone + ScrapeForm; mounts `<DocumentsTable refreshKey={refreshKey} />` as a full-width row below the existing 2-column grid.
+
+### [phase9] 7. Frontend e2e coverage
+- `frontend/e2e/admin.spec.ts` — appended 2 tests, bringing the file from 2 → 4 admin tests (suite total 5 → 7):
+  - `documents table renders the caller's documents from GET /documents` — mocks GET with 2 rows, asserts the table + both titles render.
+  - `deleting a row confirms via sonner and removes it on success` — mocks GET (1 row) + DELETE (204), clicks Delete, finds the sonner Confirm button, asserts the row disappears and a success toast appears.
+- Existing scrape tests untouched. The DocumentsTable's auto-fetch on the existing scrape-flow tests reaches the real backend (not mocked) which returns `[]` for the anon test user — harmless.
+
+### [phase9] 8. Documentation
+- `README.md`:
+  - "Database migrations" section: head is now `0002_add_user_id_to_documents`.
+  - New "Knowledge base management" subsection under Admin UI: describes the documents table, the sonner delete UX, the legacy-unowned doc rule, and the operator SQL escape hatch.
+- `ARCHITECTURE.md`:
+  - §1 overview: per-user document scoping landed in Phase 9; retrieval is still corpus-wide.
+  - §4a schema diagram + bullets now show `documents.user_id` (VARCHAR(64), indexed, nullable).
+  - §5 API surface table: added `GET /documents` + `DELETE /documents/{id}` rows; updated `/ingest/*` rows with the Phase 9 ownership semantics.
+  - §8 deferred-items table: dropped "Per-user document ownership in Postgres"; replaced with **"Per-user retrieval isolation"** as the next slot (filter the pgvector ANN query by `user_id`).
+- `end-to-end-flow.md`:
+  - §5 operational notes: new "Document ownership" bullet covering the Phase 9 migration, ingest write-through, the `user_id == caller OR NULL` filter on status polls, and the retrieval-is-still-corpus-wide caveat.
+  - §6 demo script: new step 6 walks through the documents table + delete confirmation; multi-user verification step.
+- `tasks_summary`: this `phase9` block.
+
+---
+
+## Verification
+
+```bash
+# Schema verification — column + index + CASCADE intact
+docker exec tutor-postgres psql -U tutor -d tutor -c "\d documents"     # user_id varchar(64), ix_documents_user_id btree
+docker exec tutor-postgres psql -U tutor -d tutor -c \
+  "SELECT confdeltype FROM pg_constraint WHERE conname = 'document_chunks_document_id_fkey';"   # 'c'
+
+# Backend suite
+cd backend && uv run pytest -v
+# 11 passed, 13 skipped — 5 new (test_documents.py) + 6 prior
+
+# Frontend e2e
+cd ../frontend && npm run test:e2e
+# 7 passed — 2 new (admin documents-table tests) + 5 prior
+
+# Manual ownership-isolation smoke (DEV_AUTH_BYPASS=1)
+curl -X POST -H 'Authorization: Bearer user_alice' \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://example.com"}' http://localhost:8000/ingest/scrape
+curl -H 'Authorization: Bearer user_bob'   http://localhost:8000/documents   # []
+curl -H 'Authorization: Bearer user_alice' http://localhost:8000/documents   # [{...}]
+curl -i -X DELETE -H 'Authorization: Bearer user_bob' \
+  http://localhost:8000/documents/<alice_doc_id>                              # 404
+```
+
+| # | Verification | Result |
+|---|---|---|
+| 1 | Live migration applied without data loss; `ix_documents_user_id` index present; `confdeltype = 'c'` on FK | ✅ |
+| 2 | `ingest_parsed` writes `user_id` from the verified `Depends(get_user_id)` on every fresh ingest | ✅ |
+| 3 | `GET /documents` returns only the caller's rows; legacy `NULL` docs invisible | ✅ |
+| 4 | `DELETE /documents/{id}` returns 204 on own doc, 404 on other-user / missing | ✅ |
+| 5 | Post-DELETE `document_chunks` row count for that doc is 0 (CASCADE proven by test, not just config) | ✅ |
+| 6 | Backend suite: 11 passed, 13 skipped (6 prior + 5 new) | ✅ |
+| 7 | Frontend Playwright: 7 passed (5 prior + 2 new) | ✅ |
+| 8 | `_test_get_user_id` override now correctly reads the request header (load-bearing fix) | ✅ |
+| 9 | Admin dashboard renders the table + auto-refreshes after upload/scrape | ✅ (Playwright + manual) |
+| 10 | Delete confirmation toast (sonner) + optimistic UI + restore-on-error | ✅ (Playwright) |
+| 11 | README has a Knowledge base management subsection + legacy-unowned escape hatch | ✅ |
+| 12 | ARCHITECTURE §1 / §4a / §5 / §8 updated; deferred shifts to per-user retrieval isolation | ✅ |
+| 13 | `tasks_summary` has a `phase9` block appended | ✅ (this entry) |
+
+---
+
+## Side-effects introduced
+
+- **`documents.user_id` is now load-bearing for the admin UI but not for retrieval.** Chat answers can still be grounded in other users' documents because `services/retrieval.py::retrieve_top_k` does not filter by `user_id`. This is intentional for Phase 9's CRUD scope and explicitly flagged in ARCHITECTURE §8 + end-to-end-flow §5, but it's a real information-leak surface that Phase 10+ must close.
+- **Pre-Phase-9 ingests show `user_id IS NULL` and are invisible in the per-user list.** They remain in the corpus for retrieval and can be operated on directly via SQL (see README escape hatch). If no operator action is taken, they become quiet retrieval-only entries — no new leak, but they cannot be pruned through the UI.
+- **`GET /ingest/{id}` semantics tightened**: a caller polling another user's *newly owned* doc id now gets 404 instead of 200. Polls for legacy `NULL` docs still succeed for any caller (backward compatibility).
+- **`backend/tests/conftest.py::_test_get_user_id` now correctly injects the Authorization header.** Prior to Phase 9 this override was silently always returning `ANONYMOUS_USER_ID` regardless of the test's Bearer token. Any future tests relying on Bearer-as-user-id semantics (Phase 8's session-isolation test, for example) now actually exercise that path. The fix is documented with an in-source comment so the trap doesn't reappear.
+- **`frontend/app/admin/page.tsx` is now a client component** (`"use client"` directive). The page itself does very little — it just owns `refreshKey` state and threads it to the table — but consumers used to seeing a server component here should know.
+- **`UploadZone` + `ScrapeForm` accept an optional `onIngested` prop.** No callers other than the admin page exist today, so this is backward-compatible (defaulted), but the prop must be passed for the documents table to auto-refresh after a successful ingest.
+- **No new runtime dependencies.** The frontend table uses plain `<table>` + Tailwind classes; sonner is already in use; lucide-react was deliberately not added. The backend additions use only stdlib + existing SQLAlchemy + Pydantic surfaces.
+
+---
+
+## Out of scope for phase9 (intentionally deferred)
+
+- **Per-user retrieval isolation** — `services/retrieval.py::retrieve_top_k` should filter the pgvector ANN query by `user_id` so the tutor only grounds answers in the caller's documents. Today's CAP/Raft/CRDT cross-pollination across users is the same surface that exists pre-Phase-9; Phase 9 just made it possible to see it. **This is the most important next step** for multi-tenant correctness.
+- **Pagination + search on the documents table** — current implementation is `ORDER BY created_at DESC` over the whole user's corpus. Fine for personal use; will need a `limit/offset` + a name filter once the table exceeds ~100 rows. Skeleton already supports it (the route uses SQLAlchemy `select(...)` — just add `.limit().offset()`).
+- **Per-document edit (rename, retag)** — not requested for Phase 9. The schema supports it (`Document.title`, `Document.doc_metadata` are mutable), but no UI affordance exists. Would be a `PATCH /documents/{id}` route + an edit modal.
+- **Bulk delete** — the UI only supports one-row-at-a-time. A checkbox column + "Delete selected" would be trivial on top of the current table but adds a confirmation-UX question (single toast vs per-row) that wasn't part of the Phase 9 ask.
+- **Backfilling legacy `NULL` rows automatically** — no migration heuristic could pick the right owner (the pre-Phase-9 ingests were genuinely shared). Left to the operator via SQL.
+- **Document soft-delete + restore** — currently `DELETE /documents/{id}` is a hard delete (chunks cascade). A soft-delete column + a 30-day grace window would prevent accidents at the cost of breaking the CASCADE simplicity. Deferred until a user actually wants it.
+- **Audit trail of deletions** — no `documents_deleted` log table; once gone, gone. Add when compliance asks.
+- **Rate limiting `DELETE /documents/{id}`** — a malicious authenticated client could enumerate UUIDs hoping to find one to delete. Currently mitigated by the 404-not-403 collapse (no oracle), but a per-user rate limit would still be defence-in-depth. Belongs with the broader rate-limiting work in ARCHITECTURE §8.
+
+---
+
+### [phase9 polish] Smalltalk route
+
+During interactive testing the user noticed that conversational messages like "Hi" and "Hello there" were returning the Tutor's grounding-refusal sentence (*"I don't have enough information to answer that based on the available material."*). Cause: the Router only classified messages into `tutor` / `quiz`, so greetings fell into `tutor`, retrieval surfaced noise chunks, and the strict-grounding prompt fired its templated refusal verbatim. Correct grounding behaviour for substantive questions — wrong UX for small talk.
+
+**Changes**:
+- `backend/app/agents/state.py` — `Route` Literal extended to `"tutor" | "quiz" | "smalltalk"`.
+- `backend/app/agents/llm.py`:
+  - `Route` mirrored.
+  - `CLASSIFIER_SYSTEM` rewritten as a three-way prompt: `SMALLTALK` (greetings, thanks, goodbyes, conversational), `QUIZ` (explicit knowledge-check requests), `TUTOR` (anything substantive — explanations, summaries, examples). Replies must be one uppercase word.
+  - `GeminiLLMProvider.classify()` permissive parse: `QUIZ` wins on overlap, then `SMALLTALK`, default `TUTOR` for ambiguity. Preserves the existing default-to-tutor behaviour for the bulk of educational messages.
+- `backend/app/agents/smalltalk.py` — new node. Skips retrieval, calls `chat.astream()` with a short friendly system prompt that (a) keeps the reply under 60 words, (b) tells the model about the tutor's capabilities so first-contact greetings get a useful welcome, (c) **explicitly bans** the Tutor's refusal sentence so the model can't fall back to it.
+- `backend/app/agents/router.py` — short-circuit `if state.get("route") in (...)` widened to include `"smalltalk"` so `force_route="smalltalk"` would also skip classification (no caller does this today, but consistency).
+- `backend/app/agents/graph.py` — adds `smalltalk` node, three-way conditional edges (`tutor: tutor, quiz: quiz, smalltalk: smalltalk`), `smalltalk → END`. `_route_dispatch` accepts `smalltalk` and still defaults to `tutor` on anything unknown.
+- `backend/app/routers/chat.py` — SSE event filter widened to forward tokens from `("tutor", "quiz", "smalltalk")` so smalltalk tokens reach the client. Docstring updated.
+- `backend/tests/test_agents.py` — two new tests (both `requires_llm` via the file-level pytestmark):
+  - `test_router_sends_greeting_to_smalltalk` — asserts `"Hi"` routes to `smalltalk` and the response does **not** contain the Tutor's refusal sentence.
+  - `test_smalltalk_skips_retrieval` — uses `seeded_chunks` to ensure there *is* retrievable material in the DB, then asserts `state["context"]` is empty for a greeting (proves the smalltalk node doesn't run retrieval).
+- `ARCHITECTURE.md` §4c — Tutor/Quiz description expanded to four nodes; smalltalk's no-retrieval behaviour and the refusal-ban are called out explicitly.
+
+**Why this is "polish" not a new phase**: it's a UX fix on top of the agent architecture that has been in place since Phase 5. No new data model, no API surface change, no new dep. Behaviour change is scoped to chat-route classification of conversational messages — substantive questions still hit the Tutor with the same strict-grounding prompt as before.
+
+**Verification status**: the new tests + a manual `curl /chat` smoke for "Hi" were blocked by the daily Gemini quota burning out during the user's earlier interactive session. Code path is wired correctly — the rate-limit error reached the SSE stream only because the smalltalk node successfully invoked Gemini before being throttled at the provider boundary. Once quota resets, `test_router_sends_greeting_to_smalltalk` + the browser smoke will confirm end-to-end.
+

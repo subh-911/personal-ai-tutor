@@ -10,13 +10,20 @@ from app.config import settings
 from app.services.retrieval import RetrievedChunk
 
 
-Route = Literal["tutor", "quiz"]
+Route = Literal["tutor", "quiz", "smalltalk"]
 
 
 CLASSIFIER_SYSTEM = (
-    "You are a routing classifier. Decide whether the student's message is asking for an "
-    "EXPLANATION (route: TUTOR) or for a knowledge check / quiz / test (route: QUIZ).\n"
-    "Reply with exactly one word, uppercase: TUTOR or QUIZ. No punctuation, no explanation."
+    "You are a routing classifier for an AI tutor. Decide which category best fits the "
+    "student's message:\n"
+    "  - SMALLTALK: greetings, thanks, goodbyes, or other conversational messages that "
+    "do not ask for any subject-matter content (e.g. \"hi\", \"hello\", \"thank you\", "
+    "\"good morning\", \"how are you\").\n"
+    "  - QUIZ: an explicit request for a knowledge check / quiz / test / MCQ.\n"
+    "  - TUTOR: anything else — questions, requests for explanations, summaries, examples, "
+    "or definitions of substantive material.\n"
+    "Reply with exactly one word, uppercase: SMALLTALK, QUIZ, or TUTOR. No punctuation, "
+    "no explanation."
 )
 
 
@@ -88,9 +95,15 @@ class GeminiLLMProvider:
             [SystemMessage(content=CLASSIFIER_SYSTEM), HumanMessage(content=text)]
         )
         raw = (response.content or "").strip().upper()
-        # Permissive parse: look for QUIZ first; default to tutor on anything unexpected.
+        # Permissive parse: QUIZ takes precedence (an explicit "quiz me" message
+        # that happens to also include a greeting is still a quiz request), then
+        # SMALLTALK, and tutor is the default for anything substantive or
+        # unrecognised. The default-to-tutor branch preserves the strict-grounding
+        # behaviour for the bulk of educational messages.
         if "QUIZ" in raw:
             return "quiz"
+        if "SMALLTALK" in raw:
+            return "smalltalk"
         return "tutor"
 
     async def complete(self, messages: list[BaseMessage], *, system: str | None = None) -> str:

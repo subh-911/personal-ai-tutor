@@ -13,6 +13,17 @@ export type GetToken = () => Promise<string | null>;
 
 const INGEST_UPLOAD_URL = "/api/backend/ingest/upload";
 const INGEST_SCRAPE_URL = "/api/backend/ingest/scrape";
+const DOCUMENTS_URL = "/api/backend/documents";
+
+export type Document = {
+  id: string;
+  source_type: string;
+  source_uri: string;
+  title: string | null;
+  status: IngestStatusValue;
+  chunk_count: number;
+  created_at: string;
+};
 
 // We use XMLHttpRequest (not fetch) because `xhr.upload.onprogress` is the only
 // browser API that exposes byte-level upload progress. The route's response is
@@ -85,4 +96,38 @@ export async function scrapeUrl(url: string, getToken?: GetToken): Promise<Inges
     throw new Error(`scrape failed (${res.status}): ${detail}`);
   }
   return (await res.json()) as IngestStatus;
+}
+
+async function authHeaders(getToken?: GetToken): Promise<Record<string, string>> {
+  const token = getToken ? await getToken() : null;
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
+async function detailOrStatus(res: Response): Promise<string> {
+  let detail = res.statusText;
+  try {
+    const body = await res.json();
+    if (body?.detail) detail = body.detail;
+  } catch {
+    // ignore
+  }
+  return detail;
+}
+
+export async function listDocuments(getToken?: GetToken): Promise<Document[]> {
+  const res = await fetch(DOCUMENTS_URL, { headers: await authHeaders(getToken) });
+  if (!res.ok) {
+    throw new Error(`list documents failed (${res.status}): ${await detailOrStatus(res)}`);
+  }
+  return (await res.json()) as Document[];
+}
+
+export async function deleteDocument(id: string, getToken?: GetToken): Promise<void> {
+  const res = await fetch(`${DOCUMENTS_URL}/${id}`, {
+    method: "DELETE",
+    headers: await authHeaders(getToken),
+  });
+  if (!res.ok) {
+    throw new Error(`delete document failed (${res.status}): ${await detailOrStatus(res)}`);
+  }
 }

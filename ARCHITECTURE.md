@@ -2,7 +2,7 @@
 
 ## 1. Overview
 
-A self-hosted AI tutor that ingests user-supplied learning material (uploaded files or scraped web pages), indexes it for semantic retrieval, and serves a streaming chat interface backed by an LLM. This document describes the **skeleton** that everything else hangs off — infrastructure, the FastAPI backend with documented endpoints, the Next.js frontend, and the integration test that proves the backend can reach Postgres and Redis.
+A self-hosted AI tutor that ingests user-supplied learning material (uploaded files or scraped web pages), indexes it for semantic retrieval, and serves a streaming chat interface backed by an LLM. As of phase 9, ingested documents are scoped per Clerk-verified user — the admin dashboard lists and lets the caller delete only their own corpus (chat retrieval still spans the global corpus; see §8). This document describes the **skeleton** that everything else hangs off — infrastructure, the FastAPI backend with documented endpoints, the Next.js frontend, and the integration test that proves the backend can reach Postgres and Redis.
 
 ```
 ┌──────────────┐    HTTP/SSE     ┌──────────────────┐    SQL     ┌────────────────────────┐
@@ -74,22 +74,24 @@ The backend runs on the host (not in compose) so the dev loop is as fast as poss
 Two tables, defined in `backend/app/models.py`. **Schema is owned by Alembic** (phase 7) — the baseline revision `0001_baseline` (in `backend/alembic/versions/`) creates the `vector` extension, both tables, the FK + unique constraint, the b-tree FK index, and the HNSW ANN index. Run `alembic upgrade head` before booting the app against a fresh database; for an existing DB, `alembic stamp head` records the baseline without re-issuing DDL.
 
 ```
-┌─────────────────────────┐         ┌──────────────────────────────┐
-│ documents               │         │ document_chunks              │
-├─────────────────────────┤  1   *  ├──────────────────────────────┤
-│ id            UUID  PK  │◀────────│ document_id   UUID  FK CASCADE│
-│ source_type   TEXT      │         │ id            UUID  PK       │
-│ source_uri    TEXT      │         │ chunk_index   INT            │
-│ title         TEXT      │         │ content       TEXT           │
-│ status        TEXT      │         │ token_count   INT            │
-│ error         TEXT      │         │ embedding     vector(768)    │
-│ doc_metadata  JSONB     │         │ chunk_metadata JSONB         │
-│ created_at    TIMESTAMP │         │ created_at    TIMESTAMP      │
-│ updated_at    TIMESTAMP │         │ UNIQUE (document_id, chunk_index) │
-└─────────────────────────┘         └──────────────────────────────┘
+┌──────────────────────────────┐         ┌──────────────────────────────┐
+│ documents                    │         │ document_chunks              │
+├──────────────────────────────┤  1   *  ├──────────────────────────────┤
+│ id            UUID  PK       │◀────────│ document_id   UUID  FK CASCADE│
+│ user_id       VARCHAR(64) ix │         │ id            UUID  PK       │
+│ source_type   TEXT           │         │ chunk_index   INT            │
+│ source_uri    TEXT           │         │ content       TEXT           │
+│ title         TEXT           │         │ token_count   INT            │
+│ status        TEXT           │         │ embedding     vector(768)    │
+│ error         TEXT           │         │ chunk_metadata JSONB         │
+│ doc_metadata  JSONB          │         │ created_at    TIMESTAMP      │
+│ created_at    TIMESTAMP      │         │ UNIQUE (document_id, chunk_index) │
+│ updated_at    TIMESTAMP      │         │                              │
+└──────────────────────────────┘         └──────────────────────────────┘
 ```
 
 `documents` — one row per ingestion.
+- `user_id` — the verified Clerk user id of the uploader (e.g. `user_2abc123def`). Added in the `0002_add_user_id_to_documents` migration (phase 9). Nullable: rows ingested before phase 9 carry `NULL` (legacy / unowned) and are invisible to the per-user admin list but remain in the corpus for retrieval.
 - `source_type` — `'upload'` or `'scrape'`.
 - `source_uri` — filename for uploads, final URL for scrapes (after redirects).
 - `status` — `'processing' | 'completed' | 'failed'`. Lifecycle: starts `processing`, ends either `completed` (chunks + embeddings persisted) or `failed` (with `error` populated; partial chunks rolled back).
@@ -118,13 +120,14 @@ Two tables, defined in `backend/app/models.py`. **Schema is owned by Alembic** (
 
 ## 4c. Agents & orchestration (LangGraph)
 
-The `/chat` endpoint drives a compiled LangGraph state machine that lives in `backend/app/agents/`. Three nodes:
+The `/chat` endpoint drives a compiled LangGraph state machine that lives in `backend/app/agents/`. Four nodes:
 
-- **Router** (`agents/router.py`) — calls Gemini 2.5 Flash (`temperature=0`) with a strict system prompt demanding one of `TUTOR` / `QUIZ` and writes `state["route"]`. Does not produce an assistant message. If the caller pre-sets `state["route"]` (via `ChatRequest.force_route` → `ainvoke_graph(..., force_route=...)`), the Router preserves it and skips the LLM call — used by the frontend's "Give me an example" / "Test my knowledge" buttons to dispatch deterministically.
-- **Tutor** (`agents/tutor.py`) — retrieves the top-`k` pgvector chunks, formats them as a numbered context block, and calls `ChatGoogleGenerativeAI.astream(...)` with a **strict-grounding** system prompt. The prompt forces the model to (a) cite snippet numbers in square brackets, (b) refuse to answer when the context is insufficient (returns the literal fallback sentence), and (c) never use outside knowledge. Streaming chunks surface to the route via `astream_events`.
+- **Router** (`agents/router.py`) — calls Gemini 2.5 Flash (`temperature=0`) with a strict system prompt demanding one of `TUTOR` / `QUIZ` / `SMALLTALK` and writes `state["route"]`. Does not produce an assistant message. If the caller pre-sets `state["route"]` (via `ChatRequest.force_route` → `ainvoke_graph(..., force_route=...)`), the Router preserves it and skips the LLM call — used by the frontend's "Give me an example" / "Test my knowledge" buttons to dispatch deterministically.
+- **Tutor** (`agents/tutor.py`) — retrieves the top-`k` pgvector chunks, formats them as a numbered context block, and calls `ChatGoogleGenerativeAI.astream(...)` with a **strict-grounding** system prompt. The prompt forces the model to (a) cite snippet numbers in square brackets, (b) refuse to answer when the context is insufficient (returns the literal fallback sentence *"I don't have enough information to answer that based on the available material."*), and (c) never use outside knowledge. Streaming chunks surface to the route via `astream_events`.
 - **Quiz** (`agents/quiz.py`) — retrieves a smaller amount of grounding context (top-2) and calls Gemini with a **structured-MCQ** system prompt that pins the output to seven lines: `Question:`, `A) … D)`, `Answer:`, `Explanation:`. The route streams the chunks as they're generated.
+- **Smalltalk** (`agents/smalltalk.py`, phase 9 polish) — skips retrieval entirely. Calls Gemini with a brief friendly system prompt that replies in 1–2 sentences and, for first-contact greetings, mentions what the tutor can do. Carved out specifically so conversational messages ("hi", "thanks", "good morning") no longer get the Tutor's grounding-refusal sentence by default. The system prompt explicitly bans that refusal wording from this node.
 
-Routing is a conditional edge from `router` to either `tutor` or `quiz`; both leaves terminate. See [`DIAGRAMS.md`](./DIAGRAMS.md) for Mermaid renderings of the node flow, tutor internals, state-threading table, and request lifecycle.
+Routing is a conditional edge from `router` to either `tutor`, `quiz`, or `smalltalk`; all three leaves terminate. See [`DIAGRAMS.md`](./DIAGRAMS.md) for Mermaid renderings of the node flow, tutor internals, state-threading table, and request lifecycle.
 
 State (`agents/state.py`) is a `TypedDict` with five fields:
 - `messages: list[BaseMessage]` (LangChain message types, accumulated via the standard `add_messages` reducer)
@@ -165,13 +168,15 @@ Short-term conversation memory is owned by the server. Each chat session is one 
 
 OpenAPI 3.1 spec is served at `/openapi.json`; Swagger UI at `/docs`; ReDoc at `/redoc`. Phase 8: every route under the `chat` and `ingest` tags **requires** `Authorization: Bearer <clerk-jwt>` — unsigned-in requests get `401`. Only `/health` (and Swagger/ReDoc itself) remains world-readable. The optional `DEV_AUTH_BYPASS=1` env var on the backend re-enables permissive Bearer-as-user-id parsing for ad-hoc smoke testing — see [Authentication (Clerk)](./README.md#authentication-clerk) in the README.
 
-| Method | Path                       | Tag     | Purpose                                                      | Status            |
-|--------|----------------------------|---------|--------------------------------------------------------------|-------------------|
-| GET    | `/health`                  | health  | Liveness + Postgres + Redis dependency check.                | implemented       |
-| POST   | `/ingest/upload`           | ingest  | Upload a PDF / TXT / MD file; parse → chunk → embed → save.  | implemented       |
-| POST   | `/ingest/scrape`           | ingest  | Fetch a URL with httpx, extract text via BeautifulSoup.      | implemented       |
-| GET    | `/ingest/{ingestion_id}`   | ingest  | Poll ingestion status + chunk count.                         | implemented       |
-| POST   | `/chat`                    | chat    | Session-aware. **Token-level** SSE from Gemini; `X-Session-Id` header on response. | implemented |
+| Method | Path                       | Tag       | Purpose                                                      | Status            |
+|--------|----------------------------|-----------|--------------------------------------------------------------|-------------------|
+| GET    | `/health`                  | health    | Liveness + Postgres + Redis dependency check.                | implemented       |
+| POST   | `/ingest/upload`           | ingest    | Upload a PDF / TXT / MD file; parse → chunk → embed → save. Writes the verified Clerk user id onto the new `documents.user_id` column (phase 9). | implemented       |
+| POST   | `/ingest/scrape`           | ingest    | Fetch a URL with httpx, extract text via BeautifulSoup. Writes the verified Clerk user id onto `documents.user_id`. | implemented       |
+| GET    | `/ingest/{ingestion_id}`   | ingest    | Poll ingestion status + chunk count. Phase 9: filters by `user_id == caller OR user_id IS NULL` so legacy unowned polls still work; cross-user polls of newly owned ids return 404. | implemented       |
+| GET    | `/documents`               | documents | List the caller's ingested documents (id, source, title, status, chunk count, created_at). Ordered most-recent-first. Phase 9. | implemented       |
+| DELETE | `/documents/{id}`          | documents | Delete a document the caller owns (cascades to chunks). Returns 204 on success, 404 for missing or other-user-owned ids (existence not leaked across users). Phase 9. | implemented       |
+| POST   | `/chat`                    | chat      | Session-aware. **Token-level** SSE from Gemini; `X-Session-Id` header on response. | implemented |
 
 Ingestion runs synchronously inside the request handler — the response carries the final status (`completed` or `failed`) and the chunk count. Moving to a Redis-backed worker is a later follow-up; the API contract is forward-compatible.
 
@@ -241,7 +246,7 @@ The Playwright suite (`frontend/e2e/`) runs against the live Next.js dev server 
 
 | Concern                    | Will live in                                          |
 |---------------------------- |-------------------------------------------------------|
-| Per-user document ownership in Postgres | add `documents.user_id` (the Clerk user id) and filter retrieval by it, so users can't read each other's ingested corpus. Phase 8 gates the ingest endpoints behind auth but the corpus itself is still shared. |
+| **Per-user retrieval isolation** | phase 9 added `documents.user_id` and gated the admin list/delete by it, but chat retrieval (`services/retrieval.py::retrieve_top_k`) still scans the whole corpus — including other users' docs and legacy unowned ones. Filtering the pgvector ANN query by `user_id` is the next slot; until then, the tutor can ground answers in another user's material. |
 | Gemini cost / quota guardrails | rate-limit middleware + per-session token-spend tracking in Redis |
 | Embedding on GPU / MPS     | sentence-transformers picks up MPS automatically on Apple Silicon, but no fallback path / batch tuning yet |
 | Prompt-eval suite          | offline evaluation harness for Tutor citation accuracy and Quiz format compliance |

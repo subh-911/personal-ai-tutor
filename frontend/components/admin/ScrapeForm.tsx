@@ -6,7 +6,11 @@ import { toast } from "sonner";
 import { scrapeUrl } from "@/lib/admin";
 import { useBackendToken } from "@/lib/auth-token";
 
-export function ScrapeForm() {
+type ScrapeFormProps = {
+  onIngested?: () => void;
+};
+
+export function ScrapeForm({ onIngested }: ScrapeFormProps = {}) {
   const [url, setUrl] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const getToken = useBackendToken();
@@ -27,6 +31,7 @@ export function ScrapeForm() {
         { id: toastId },
       );
       setUrl("");
+      onIngested?.();
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       toast.error(`Scrape failed: ${message}`, { id: toastId });
