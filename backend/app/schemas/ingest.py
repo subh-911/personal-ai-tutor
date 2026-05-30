@@ -16,10 +16,26 @@ class ScrapeRequest(BaseModel):
 
 IngestStatusValue = Literal["processing", "completed", "failed"]
 
+# Phase 10 — finer-grained pipeline stage. `queued` is written by the route
+# right after the Document row is created and before the ARQ worker picks it
+# up; the worker advances the stage on each transition. `completed`/`failed`
+# mirror the terminal `status` values for UI convenience.
+IngestStage = Literal[
+    "queued", "chunking", "embedding", "persisting", "completed", "failed"
+]
+
 
 class IngestStatus(BaseModel):
     id: UUID
     status: IngestStatusValue
+    stage: IngestStage | None = Field(
+        None,
+        description=(
+            "Live pipeline stage. Set to `queued` immediately on enqueue and "
+            "advanced by the ARQ worker on each transition. Null for rows "
+            "ingested before phase 10."
+        ),
+    )
     chunk_count: int = Field(0, description="Number of chunks produced and embedded for this document.")
     title: str | None = None
     error: str | None = None

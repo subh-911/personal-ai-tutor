@@ -5,6 +5,7 @@ from fastapi import FastAPI
 from app.db import engine
 from app.redis_client import redis as redis_client
 from app.routers import chat, documents, health, ingest
+from app.workers.ingest_worker import get_arq_pool
 
 
 API_DESCRIPTION = """
@@ -29,9 +30,16 @@ OPENAPI_TAGS = [
 # touches DDL.
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    yield
-    await engine.dispose()
-    await redis_client.aclose()
+    # Phase 10: open an ARQ pool on startup so the ingest routes can enqueue
+    # jobs without paying connection-setup cost per request. The pool lives on
+    # `app.state.arq_pool`; the route grabs it via the `get_arq_pool_dep` dep.
+    app.state.arq_pool = await get_arq_pool()
+    try:
+        yield
+    finally:
+        await app.state.arq_pool.aclose()
+        await engine.dispose()
+        await redis_client.aclose()
 
 
 app = FastAPI(

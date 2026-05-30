@@ -1,8 +1,20 @@
 export type IngestStatusValue = "processing" | "completed" | "failed";
 
+// Phase 10 — finer-grained pipeline stage written by the ARQ worker. Null on
+// rows ingested before the column existed; surfaces as a label in the UI while
+// `status === "processing"`.
+export type IngestStage =
+  | "queued"
+  | "chunking"
+  | "embedding"
+  | "persisting"
+  | "completed"
+  | "failed";
+
 export type IngestStatus = {
   id: string;
   status: IngestStatusValue;
+  stage: IngestStage | null;
   chunk_count: number;
   title: string | null;
   error: string | null;
@@ -21,6 +33,9 @@ export type Document = {
   source_uri: string;
   title: string | null;
   status: IngestStatusValue;
+  // Phase 10 — populated by the ARQ worker while `status === "processing"`.
+  // Null on rows ingested before the column existed.
+  stage: IngestStage | null;
   chunk_count: number;
   created_at: string;
 };
@@ -130,4 +145,46 @@ export async function deleteDocument(id: string, getToken?: GetToken): Promise<v
   if (!res.ok) {
     throw new Error(`delete document failed (${res.status}): ${await detailOrStatus(res)}`);
   }
+}
+
+const INGEST_STATUS_URL = "/api/backend/ingest";
+
+/**
+ * Phase 10 — poll `/ingest/{id}` until the worker reports a terminal status.
+ *
+ * Resolves with the final status (`completed` or `failed`). The optional
+ * `onUpdate` callback fires on every fetched status — including the first one
+ * — so the UI can drive a live "stage" label without waiting for the terminal
+ * value. Rejects if the poll runs past `timeoutMs` (default 5 min) or hits a
+ * non-200 response, with the last error preserved.
+ */
+export async function pollIngestStatus(
+  id: string,
+  onUpdate: (s: IngestStatus) => void,
+  getToken?: GetToken,
+  opts: { intervalMs?: number; timeoutMs?: number } = {},
+): Promise<IngestStatus> {
+  const intervalMs = opts.intervalMs ?? 1500;
+  const timeoutMs = opts.timeoutMs ?? 5 * 60 * 1000;
+  const deadline = Date.now() + timeoutMs;
+
+  const fetchOnce = async (): Promise<IngestStatus> => {
+    const res = await fetch(`${INGEST_STATUS_URL}/${id}`, {
+      headers: await authHeaders(getToken),
+    });
+    if (!res.ok) {
+      throw new Error(`status poll failed (${res.status}): ${await detailOrStatus(res)}`);
+    }
+    return (await res.json()) as IngestStatus;
+  };
+
+  while (Date.now() < deadline) {
+    const status = await fetchOnce();
+    onUpdate(status);
+    if (status.status === "completed" || status.status === "failed") {
+      return status;
+    }
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+  throw new Error(`ingest ${id} did not reach a terminal status within ${timeoutMs / 1000}s`);
 }

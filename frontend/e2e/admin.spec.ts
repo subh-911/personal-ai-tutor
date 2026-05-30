@@ -5,19 +5,57 @@
 import { expect, test } from "@playwright/test";
 
 test.describe("admin page", () => {
-  test("scraping an HLD article URL shows a success toast", async ({ page }) => {
+  test("scraping an HLD article URL drives stages and shows success toast", async ({ page }) => {
+    const docId = "11111111-1111-1111-1111-111111111111";
+    // Phase 10 — POST returns 202 immediately with the queued row.
     await page.route("**/api/backend/ingest/scrape", async (route) => {
-      const body = JSON.stringify({
-        id: "11111111-1111-1111-1111-111111111111",
-        status: "completed",
-        chunk_count: 12,
-        title: "WhatsApp High-Level System Design",
-        error: null,
+      await route.fulfill({
+        status: 202,
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          id: docId,
+          status: "processing",
+          stage: "queued",
+          chunk_count: 0,
+          title: "WhatsApp High-Level System Design",
+          error: null,
+        }),
       });
+    });
+    // Stage sequence delivered by /ingest/{id}: chunking → embedding → completed.
+    const sequence = [
+      { status: "processing", stage: "chunking", chunk_count: 0 },
+      { status: "processing", stage: "embedding", chunk_count: 0 },
+      {
+        status: "completed",
+        stage: "completed",
+        chunk_count: 12,
+      },
+    ];
+    let idx = 0;
+    await page.route(`**/api/backend/ingest/${docId}`, async (route) => {
+      const next = sequence[Math.min(idx, sequence.length - 1)];
+      idx += 1;
       await route.fulfill({
         status: 200,
         headers: { "content-type": "application/json" },
-        body,
+        body: JSON.stringify({
+          id: docId,
+          status: next.status,
+          stage: next.stage,
+          chunk_count: next.chunk_count,
+          title: "WhatsApp High-Level System Design",
+          error: null,
+        }),
+      });
+    });
+    // The page also queries /documents for the table; return an empty list so
+    // the table renders the "no documents" state and doesn't kick off its own polling.
+    await page.route("**/api/backend/documents", async (route) => {
+      await route.fulfill({
+        status: 200,
+        headers: { "content-type": "application/json" },
+        body: "[]",
       });
     });
 
@@ -34,7 +72,7 @@ test.describe("admin page", () => {
     const successToast = page.getByText(
       /scraped.*whatsapp high-level system design.*12 chunks/i,
     );
-    await expect(successToast).toBeVisible({ timeout: 10_000 });
+    await expect(successToast).toBeVisible({ timeout: 15_000 });
     await expect(page.getByTestId("scrape-url-input")).toHaveValue("");
   });
 

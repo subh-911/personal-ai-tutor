@@ -4,6 +4,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field
 
+from app.schemas.ingest import IngestStage
+
 DocumentStatusValue = Literal["processing", "completed", "failed"]
 
 
@@ -13,5 +15,6 @@ class DocumentSummary(BaseModel):
     source_uri: str
     title: str | None = None
     status: DocumentStatusValue
+    stage: IngestStage | None = None
     chunk_count: int = Field(0, description="Number of chunks produced and embedded for this document.")
     created_at: datetime

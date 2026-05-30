@@ -143,7 +143,7 @@ Captured against the running instance on `2026-05-29`. Commands shown are reprod
 
 ### Step 0 — Ingestion (already happened)
 
-User dragged a Markdown file onto `/admin`'s upload zone (or paste a URL into the Scrape form). The route `POST /ingest/upload` parsed → chunked → embedded → persisted in **one synchronous transaction**.
+User dragged a Markdown file onto `/admin`'s upload zone (or paste a URL into the Scrape form). Phase 10: the route `POST /ingest/upload` parses, persists a `processing/queued` row, enqueues an ARQ job, and returns **202 Accepted** immediately. The `arq` worker process (`uv run arq app.workers.ingest_worker.WorkerSettings`) picks up the job, advances `Document.stage` through `chunking → embedding → persisting → completed`, and the dashboard polls `GET /ingest/{id}` every 1.5 s for the live label.
 
 ```text
 $ docker exec tutor-postgres psql -U tutor -d tutor -c "SELECT … FROM documents …;"
@@ -154,12 +154,14 @@ $ docker exec tutor-postgres psql -U tutor -d tutor -c "SELECT … FROM document
 
 **Verified pipeline steps for this document:**
 
-| # | Service                                | Behaviour                                                                 |
-|---|----------------------------------------|---------------------------------------------------------------------------|
-| 1 | `services/parser.py::parse_upload`     | Detected MIME → routed to `parse_text` → utf-8 decoded                    |
-| 2 | `services/chunker.py::chunk_text`      | LlamaIndex `SentenceSplitter(chunk_size=512, chunk_overlap=128)` → **31 chunks** |
-| 3 | `services/embeddings.py::HuggingFaceEmbeddingProvider.embed_batch` | Lazy-loaded `sentence-transformers/all-mpnet-base-v2`, ran `model.encode(normalize=True)` in a worker thread; output was 31 × 768-d unit vectors |
-| 4 | `services/ingest.py::ingest_parsed`    | One `Document` + 31 `DocumentChunk` rows in a single transaction; status = `completed` |
+| # | Service                                | Process | Behaviour                                                                 |
+|---|----------------------------------------|---------|---------------------------------------------------------------------------|
+| 1 | `services/parser.py::parse_upload`     | API     | Detected MIME → routed to `parse_text` → utf-8 decoded                    |
+| 2 | `services/ingest.py::create_pending_document` | API     | `Document(status='processing', stage='queued')` row committed before the response returns |
+| 3 | `workers/ingest_worker.py::embed_document` | Worker  | ARQ pulled the job from Redis DB 1 (`arq:queue:default`) within ~1 ms; loaded the parsed text from the payload |
+| 4 | `services/chunker.py::chunk_text`      | Worker  | LlamaIndex `SentenceSplitter(chunk_size=512, chunk_overlap=128)` → **31 chunks**. `stage='chunking'` committed first |
+| 5 | `services/embeddings.py::HuggingFaceEmbeddingProvider.embed_batch` | Worker  | Lazy-loaded `sentence-transformers/all-mpnet-base-v2` (warm in worker after first job), `model.encode(normalize=True)` in a thread; output was 31 × 768-d unit vectors. `stage='embedding'` committed first |
+| 6 | `services/ingest.py::embed_pending_document` (persist phase) | Worker  | 31 `DocumentChunk` rows in one bulk insert; final `status='completed', stage='completed'` commit unblocked the polling client |
 
 ```text
 $ docker exec tutor-postgres psql -U tutor -d tutor -c "
@@ -350,7 +352,8 @@ The error is also persisted to Redis as part of the assistant turn — surfaces 
 - **Schema is owned by Alembic** *(Phase 7)*: tables, FK, unique constraint, and the HNSW ANN index are all created by `backend/alembic/versions/0001_baseline.py`. Run `alembic upgrade head` against a fresh DB; for an already-populated DB, `alembic stamp head` records the baseline without re-issuing DDL. The lifespan no longer touches schema.
 - **Auth in dev vs prod** *(Phase 8)*: by default the backend requires a Clerk-signed JWT on every `/chat` and `/ingest/*` request — unauthenticated requests get `401`. For local curl smoke testing, set `DEV_AUTH_BYPASS=1` in `.env` to fall back to the pre-Phase-8 permissive Bearer parser (any token value accepted verbatim as the user id; missing header → fixed anonymous string). A `WARNING` is logged on boot whenever bypass is on so it can't slip into production unnoticed. The Playwright suite uses this same flag, plus a parallel `NEXT_PUBLIC_TEST_DISABLE_AUTH=1` on the frontend that skips `ClerkProvider` and the `clerkMiddleware`, so the e2e tests run hermetically without real Clerk credentials.
 - **Redis key shape after Phase 8**: `chat:user:user_2abc123def:session:<uuid>:messages` — the `user_xxx` segment is now a verified Clerk user id string. Pre-Phase-8 anonymous-UUID keys (`chat:user:00000000-…`) are orphaned and retire via the 30-day TTL.
-- **Document ownership** *(Phase 9)*: every fresh ingest writes the verified Clerk user id onto `documents.user_id` (added by migration `0002_add_user_id_to_documents`). The admin dashboard's documents table and `DELETE /documents/{id}` filter strictly by that column — users only see and can delete their own uploads. `GET /ingest/{id}` (status polls) preserves backward compatibility by accepting `user_id == caller OR user_id IS NULL`, so legacy polls keep working. **Chat retrieval is still corpus-wide** — the pgvector ANN query in `services/retrieval.py::retrieve_top_k` does not filter by `user_id`, so the tutor can ground answers in other users' or legacy documents. Tightening this is deferred to phase 10+ (see ARCHITECTURE §8). Operator escape hatch for legacy nulls: `UPDATE documents SET user_id = 'user_xxx' WHERE user_id IS NULL;` to attribute them, or `DELETE FROM documents WHERE user_id IS NULL;` to drop them (chunks cascade).
+- **Document ownership** *(Phase 9)*: every fresh ingest writes the verified Clerk user id onto `documents.user_id` (added by migration `0002_add_user_id_to_documents`). The admin dashboard's documents table and `DELETE /documents/{id}` filter strictly by that column — users only see and can delete their own uploads. `GET /ingest/{id}` (status polls) preserves backward compatibility by accepting `user_id == caller OR user_id IS NULL`, so legacy polls keep working. **Chat retrieval is still corpus-wide** — the pgvector ANN query in `services/retrieval.py::retrieve_top_k` does not filter by `user_id`, so the tutor can ground answers in other users' or legacy documents. Tightening this is deferred (see ARCHITECTURE §8). Operator escape hatch for legacy nulls: `UPDATE documents SET user_id = 'user_xxx' WHERE user_id IS NULL;` to attribute them, or `DELETE FROM documents WHERE user_id IS NULL;` to drop them (chunks cascade).
+- **Async ingestion** *(Phase 10)*: the heavy `model.encode()` work runs in a separate `arq` worker process — `uv run arq app.workers.ingest_worker.WorkerSettings` from the `backend/` directory. The API process never loads `sentence-transformers/all-mpnet-base-v2`, so a 100-chunk ingest cannot stall a concurrent `/chat` SSE stream. ARQ keys live in Redis DB **1** (sessions are on DB 0); inspect with `redis-cli -p 6380 -n 1 KEYS 'arq:*'`. Worker model warm-up: the first job after the worker boots takes ~30 s extra while the model loads; subsequent jobs run at steady-state speed. `max_tries=1` means a crashed worker leaves the row at whatever stage was last committed — a re-upload is the recovery path. Operator can find such rows with `SELECT id, title, stage FROM documents WHERE status='processing' AND updated_at < now() - interval '10 minutes';`.
 - **Action buttons bypass the Router's LLM call** by sending `force_route: "tutor" | "quiz"` in the request body. The router node short-circuits when `state["route"]` is already set — saves a Gemini call and gives the user deterministic routing for the "Give me an example" / "Test my knowledge" affordances.
 
 ---

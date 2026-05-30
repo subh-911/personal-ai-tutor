@@ -3,16 +3,23 @@
 import { useCallback, useRef, useState, type DragEvent, type ChangeEvent } from "react";
 import { toast } from "sonner";
 
-import { uploadFile, type IngestStatus } from "@/lib/admin";
+import {
+  pollIngestStatus,
+  uploadFile,
+  type IngestStage,
+  type IngestStatus,
+} from "@/lib/admin";
 import { useBackendToken } from "@/lib/auth-token";
 
-type UploadStatus = "pending" | "uploading" | "done" | "error";
+type UploadStatus = "pending" | "uploading" | "processing" | "done" | "error";
 
 type UploadItem = {
   id: string;
   file: File;
   status: UploadStatus;
+  // 0..1 — represents combined wire upload (first half) and worker stage (second half).
   progress: number;
+  stage?: IngestStage | null;
   result?: IngestStatus;
   error?: string;
 };
@@ -24,6 +31,27 @@ const ACCEPTED_MIMES = new Set([
   "text/x-markdown",
 ]);
 const ACCEPTED_EXTS = [".pdf", ".txt", ".md", ".markdown"];
+
+// Phase 10 — two-phase progress bar. The XHR upload covers 0..50%; the worker's
+// stage transitions cover 50..100%. These weights are subjective but match the
+// rough wall-clock balance for typical documents.
+const STAGE_PROGRESS: Record<IngestStage, number> = {
+  queued: 0.55,
+  chunking: 0.7,
+  embedding: 0.85,
+  persisting: 0.95,
+  completed: 1.0,
+  failed: 1.0,
+};
+
+const STAGE_LABEL: Record<IngestStage, string> = {
+  queued: "Queued",
+  chunking: "Chunking…",
+  embedding: "Embedding…",
+  persisting: "Saving…",
+  completed: "Done",
+  failed: "Failed",
+};
 
 function isAccepted(file: File): boolean {
   if (ACCEPTED_MIMES.has(file.type)) return true;
@@ -64,19 +92,50 @@ export function UploadZone({ onIngested }: UploadZoneProps = {}) {
     update({ status: "uploading" });
 
     try {
-      const result = await uploadFile(
+      const accepted = await uploadFile(
         file,
         null,
         (loaded, total) => {
-          update({ progress: total > 0 ? loaded / total : 0 });
+          // Map wire-upload bytes to the first half of the bar (0..0.5).
+          update({ progress: total > 0 ? (loaded / total) * 0.5 : 0 });
         },
         getToken,
       );
-      update({ status: "done", progress: 1, result });
-      toast.success(
-        `Ingested "${file.name}" — ${result.chunk_count} chunk${result.chunk_count === 1 ? "" : "s"}`,
-      );
+      // Notify the parent immediately so DocumentsTable picks up the queued row.
       onIngested?.();
+      update({
+        status: "processing",
+        progress: STAGE_PROGRESS.queued,
+        stage: "queued",
+        result: accepted,
+      });
+
+      const final = await pollIngestStatus(
+        accepted.id,
+        (s) => {
+          if (s.stage) {
+            update({ stage: s.stage, progress: STAGE_PROGRESS[s.stage] });
+          }
+        },
+        getToken,
+      );
+
+      if (final.status === "completed") {
+        update({ status: "done", progress: 1, stage: "completed", result: final });
+        toast.success(
+          `Ingested "${file.name}" — ${final.chunk_count} chunk${final.chunk_count === 1 ? "" : "s"}`,
+        );
+        // Refresh the table again so the row's chunk_count and "ready" badge update.
+        onIngested?.();
+      } else {
+        update({
+          status: "error",
+          stage: "failed",
+          error: final.error ?? "worker reported failure",
+        });
+        toast.error(`Ingest failed for "${file.name}": ${final.error ?? "worker reported failure"}`);
+        onIngested?.();
+      }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       update({ status: "error", error: message });
@@ -130,7 +189,8 @@ export function UploadZone({ onIngested }: UploadZoneProps = {}) {
       <h2 className="mb-3 text-lg font-semibold">Upload files</h2>
       <p className="mb-4 text-sm text-zinc-600 dark:text-zinc-400">
         Drop one or more <code>.pdf</code>, <code>.txt</code>, or <code>.md</code> files below.
-        The full ingestion pipeline (parse → chunk → embed → save) runs server-side.
+        The server queues the chunk + embed work onto a background worker; you&apos;ll see live
+        stage progress.
       </p>
 
       <div
@@ -180,13 +240,23 @@ export function UploadZone({ onIngested }: UploadZoneProps = {}) {
                 </span>
                 <span className="shrink-0 text-xs text-zinc-500">{formatBytes(it.file.size)}</span>
               </div>
-              {it.status === "uploading" && (
-                <div className="mt-2 h-1.5 w-full overflow-hidden rounded bg-zinc-200 dark:bg-zinc-700">
-                  <div
-                    className="h-full bg-blue-600 transition-[width]"
-                    style={{ width: `${Math.round(it.progress * 100)}%` }}
-                  />
-                </div>
+              {(it.status === "uploading" || it.status === "processing") && (
+                <>
+                  <div className="mt-2 h-1.5 w-full overflow-hidden rounded bg-zinc-200 dark:bg-zinc-700">
+                    <div
+                      className="h-full bg-blue-600 transition-[width]"
+                      style={{ width: `${Math.round(it.progress * 100)}%` }}
+                    />
+                  </div>
+                  {it.status === "processing" && it.stage && (
+                    <p
+                      className="mt-1 text-xs text-zinc-500 dark:text-zinc-400"
+                      data-testid="upload-stage"
+                    >
+                      {STAGE_LABEL[it.stage]}
+                    </p>
+                  )}
+                </>
               )}
               {it.status === "done" && it.result && (
                 <p className="mt-1 text-xs text-green-700 dark:text-green-400">

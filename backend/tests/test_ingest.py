@@ -1,61 +1,57 @@
 from __future__ import annotations
 
-import numpy as np
 import pytest
 from httpx import AsyncClient
-from sqlalchemy import select
+from sqlalchemy import func, select
 
-from app.config import settings
 from app.db import async_session_maker
 from app.models import Document, DocumentChunk
 
 pytestmark = pytest.mark.usefixtures("db_clean")
 
 
-async def test_upload_pdf_creates_chunks_with_embeddings(
-    client: AsyncClient, sample_pdf_bytes: bytes
+async def test_upload_pdf_enqueues_embed_job(
+    client: AsyncClient, sample_pdf_bytes: bytes, arq_pool_stub
 ) -> None:
+    # Phase 10: the route's contract is "persist + enqueue". It returns 202
+    # immediately with status="processing", stage="queued"; chunks land later
+    # via the worker. Chunk-level assertions live in test_workers.py.
     files = {"file": ("sample.pdf", sample_pdf_bytes, "application/pdf")}
     response = await client.post("/ingest/upload", files=files, data={"title": "Phase 1 sample"})
 
-    assert response.status_code == 200, response.text
+    assert response.status_code == 202, response.text
     body = response.json()
-    assert body["status"] == "completed", body
-    assert body["chunk_count"] >= 1
+    assert body["status"] == "processing", body
+    assert body["stage"] == "queued", body
+    assert body["chunk_count"] == 0, body
     assert body["title"] == "Phase 1 sample"
     doc_id = body["id"]
 
+    # The row is persisted before the route returns so the polling client has
+    # something to GET against.
     async with async_session_maker() as session:
         documents = (await session.execute(select(Document))).scalars().all()
         assert len(documents) == 1
         document = documents[0]
         assert str(document.id) == doc_id
         assert document.source_type == "upload"
-        assert document.status == "completed"
+        assert document.status == "processing"
+        assert document.stage == "queued"
         assert document.title == "Phase 1 sample"
         assert document.doc_metadata.get("format") == "pdf"
-        assert document.doc_metadata.get("page_count", 0) >= 1
-
-        chunks = (
-            (
-                await session.execute(
-                    select(DocumentChunk)
-                    .where(DocumentChunk.document_id == document.id)
-                    .order_by(DocumentChunk.chunk_index)
-                )
-            )
-            .scalars()
-            .all()
+        # No chunks yet — the worker is what writes them.
+        chunks_present = await session.scalar(
+            select(func.count()).select_from(DocumentChunk).where(DocumentChunk.document_id == document.id)
         )
-        assert len(chunks) == body["chunk_count"]
-        assert [c.chunk_index for c in chunks] == list(range(len(chunks)))
-        assert all(c.content.strip() for c in chunks)
-        assert all(c.token_count > 0 for c in chunks)
+        assert chunks_present == 0
 
-        first_embedding = np.asarray(chunks[0].embedding)
-        assert first_embedding.shape == (settings.embedding_dim,)
-        assert np.issubdtype(first_embedding.dtype, np.floating)
-        assert np.linalg.norm(first_embedding) > 0  # not all zeros
+    # Worker enqueue happened exactly once with the parsed text payload.
+    assert len(arq_pool_stub.calls) == 1
+    call = arq_pool_stub.calls[0]
+    assert call["function"] == "embed_document"
+    assert call["kwargs"]["document_id"] == doc_id
+    assert isinstance(call["kwargs"]["text"], str)
+    assert len(call["kwargs"]["text"]) > 0
 
 
 async def test_upload_rejects_unsupported_mime(client: AsyncClient) -> None:

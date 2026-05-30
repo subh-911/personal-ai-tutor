@@ -3,6 +3,7 @@ from __future__ import annotations
 from uuid import UUID
 
 import httpx
+from arq.connections import ArqRedis
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -12,8 +13,9 @@ from app.config import settings
 from app.db import get_session
 from app.models import Document, DocumentChunk
 from app.schemas.ingest import IngestStatus, ScrapeRequest
-from app.services.ingest import ingest_parsed
+from app.services.ingest import create_pending_document
 from app.services.parser import UnsupportedMediaError, fetch_url, parse_html, parse_upload
+from app.workers.ingest_worker import get_arq_pool_dep
 
 router = APIRouter(prefix="/ingest", tags=["ingest"])
 
@@ -25,6 +27,7 @@ async def _to_status(session: AsyncSession, document: Document) -> IngestStatus:
     return IngestStatus(
         id=document.id,
         status=document.status,  # type: ignore[arg-type]
+        stage=document.stage,  # type: ignore[arg-type]
         chunk_count=int(chunk_count or 0),
         title=document.title,
         error=document.error,
@@ -34,13 +37,17 @@ async def _to_status(session: AsyncSession, document: Document) -> IngestStatus:
 @router.post(
     "/upload",
     response_model=IngestStatus,
+    status_code=status.HTTP_202_ACCEPTED,
     summary="Upload a file for ingestion",
     description=(
         "Accepts a `multipart/form-data` upload. Supported types: `application/pdf`, `text/plain`, "
-        "`text/markdown` (also `.md` filename fallback). Parsing, chunking, and embedding run "
-        "synchronously; the response carries the final status."
+        "`text/markdown` (also `.md` filename fallback). The route parses the file synchronously, "
+        "persists a `processing/queued` row, and enqueues the chunk+embed work onto the ARQ worker "
+        "queue. Returns **202 Accepted** with the row id immediately — poll `GET /ingest/{id}` until "
+        "`status == 'completed'` (or `'failed'`). The `stage` field reports the live worker phase."
     ),
     responses={
+        202: {"description": "Job accepted and queued; poll /ingest/{id} for stage transitions."},
         413: {"description": "Upload exceeds the configured size limit."},
         415: {"description": "Unsupported file type."},
     },
@@ -50,6 +57,7 @@ async def upload_document(
     title: str | None = Form(None, description="Optional human-readable title; defaults to the filename or PDF metadata."),
     session: AsyncSession = Depends(get_session),
     user_id: str = Depends(get_user_id),
+    arq_pool: ArqRedis = Depends(get_arq_pool_dep),
 ) -> IngestStatus:
     data = await file.read()
     if len(data) > settings.max_upload_bytes:
@@ -60,7 +68,7 @@ async def upload_document(
     except UnsupportedMediaError as exc:
         raise HTTPException(status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, str(exc)) from exc
 
-    document = await ingest_parsed(
+    document = await create_pending_document(
         session,
         parsed,
         source_type="upload",
@@ -68,22 +76,34 @@ async def upload_document(
         title=title,
         user_id=user_id,
     )
+    await arq_pool.enqueue_job(
+        "embed_document",
+        document_id=str(document.id),
+        text=parsed.text,
+    )
     return await _to_status(session, document)
 
 
 @router.post(
     "/scrape",
     response_model=IngestStatus,
+    status_code=status.HTTP_202_ACCEPTED,
     summary="Scrape a URL for ingestion",
     description=(
-        "Fetches the seed URL, extracts text via BeautifulSoup, chunks, embeds, and persists. "
-        "`max_depth` is reserved for future multi-page crawling and is ignored in phase 1."
+        "Fetches the seed URL, extracts text via BeautifulSoup, persists a `processing/queued` row, "
+        "and enqueues the chunk+embed work onto the ARQ worker queue. Returns **202 Accepted** with "
+        "the row id immediately — poll `GET /ingest/{id}` until `status == 'completed'` (or "
+        "`'failed'`). `max_depth` is reserved for future multi-page crawling."
     ),
+    responses={
+        202: {"description": "Job accepted and queued; poll /ingest/{id} for stage transitions."},
+    },
 )
 async def scrape_url(
     payload: ScrapeRequest,
     session: AsyncSession = Depends(get_session),
     user_id: str = Depends(get_user_id),
+    arq_pool: ArqRedis = Depends(get_arq_pool_dep),
 ) -> IngestStatus:
     try:
         html, final_url = await fetch_url(str(payload.url))
@@ -91,13 +111,18 @@ async def scrape_url(
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, f"failed to fetch URL: {exc}") from exc
 
     parsed = parse_html(html, base_url=final_url)
-    document = await ingest_parsed(
+    document = await create_pending_document(
         session,
         parsed,
         source_type="scrape",
         source_uri=final_url,
         title=None,
         user_id=user_id,
+    )
+    await arq_pool.enqueue_job(
+        "embed_document",
+        document_id=str(document.id),
+        text=parsed.text,
     )
     return await _to_status(session, document)
 
