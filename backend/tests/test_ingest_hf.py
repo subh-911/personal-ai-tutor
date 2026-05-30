@@ -15,6 +15,7 @@ from app.config import settings
 from app.db import async_session_maker
 from app.models import Document, DocumentChunk
 from app.services.embeddings import HuggingFaceEmbeddingProvider, get_embedding_provider
+from app.workers.ingest_worker import embed_document
 
 
 pytestmark = pytest.mark.usefixtures("db_clean")
@@ -72,7 +73,9 @@ def _hash_vector(text: str, dim: int) -> list[float]:
     return vec.tolist()
 
 
-async def test_real_hf_model_used_for_ingested_document(client: AsyncClient) -> None:
+async def test_real_hf_model_used_for_ingested_document(
+    client: AsyncClient, arq_pool_stub
+) -> None:
     files = {
         "file": (
             "news-analysis-2026-05-28.txt",
@@ -86,11 +89,21 @@ async def test_real_hf_model_used_for_ingested_document(client: AsyncClient) -> 
         data={"title": "Daily News Analysis — 28 May 2026"},
     )
 
-    assert response.status_code == 200, response.text
+    # Phase 10: the route hands off to the ARQ worker. Drive the worker inline
+    # here to keep the brain-transplant assertion (real HF model, not stub-hash)
+    # working end-to-end without standing up a real worker process in tests.
+    assert response.status_code == 202, response.text
     body = response.json()
-    assert body["status"] == "completed", body
-    assert body["chunk_count"] >= 1, (
-        f"expected at least one chunk, got {body['chunk_count']}"
+    assert body["status"] == "processing", body
+    assert body["stage"] == "queued", body
+
+    assert len(arq_pool_stub.calls) == 1
+    call = arq_pool_stub.calls[0]
+    assert call["function"] == "embed_document"
+    await embed_document(
+        {},
+        document_id=call["kwargs"]["document_id"],
+        text=call["kwargs"]["text"],
     )
 
     async with async_session_maker() as session:

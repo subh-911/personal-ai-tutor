@@ -11,12 +11,21 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import text
 
 from app.auth import ANONYMOUS_USER_ID, get_user_id
+from app.config import settings
 from app.db import async_session_maker, engine
 from app.main import app
 from app.models import Base, Document, DocumentChunk
 from app.redis_client import redis as redis_client
 from app.services.embeddings import get_embedding_provider
 from app.services.session import SESSION_KEY_PREFIX
+from app.workers.ingest_worker import get_arq_pool_dep
+
+# Force the dev auth bypass off for the test run regardless of what the local
+# .env carries. Tests install their own `get_user_id` override (below) — if the
+# real dep silently fell back to permissive parsing because someone set
+# DEV_AUTH_BYPASS=1 in .env for local curl convenience, the unauth-401 tests
+# would falsely pass with 200.
+settings.dev_auth_bypass = False
 
 
 async def _test_get_user_id(authorization: str | None = Header(default=None)) -> str:
@@ -77,6 +86,43 @@ def _override_auth():
     app.dependency_overrides[get_user_id] = _test_get_user_id
     yield
     app.dependency_overrides.pop(get_user_id, None)
+
+
+class _StubArqPool:
+    """Drop-in for `arq.connections.ArqRedis` in tests. Records enqueue_job
+    calls so route tests can assert "this request enqueued the right job".
+
+    Real ARQ is process-spanning and would need a live Redis + worker to verify
+    end-to-end. We test the worker function directly in `test_workers.py`; the
+    route's contract here is just "persist + enqueue".
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    async def enqueue_job(self, function: str, *args, **kwargs):
+        self.calls.append({"function": function, "args": args, "kwargs": kwargs})
+        return None
+
+    def reset(self) -> None:
+        self.calls = []
+
+
+@pytest.fixture(scope="session")
+def arq_pool_stub() -> _StubArqPool:
+    return _StubArqPool()
+
+
+@pytest.fixture(autouse=True)
+def _override_arq_pool(arq_pool_stub: _StubArqPool):
+    # Phase 10: `get_arq_pool_dep` in production reads `app.state.arq_pool`
+    # set by the lifespan. The ASGITransport used by the test client doesn't
+    # invoke the lifespan, so the stub override is the canonical path here
+    # *and* lets us assert on enqueue calls without booting a real worker.
+    arq_pool_stub.reset()
+    app.dependency_overrides[get_arq_pool_dep] = lambda: arq_pool_stub
+    yield
+    app.dependency_overrides.pop(get_arq_pool_dep, None)
 
 
 @pytest_asyncio.fixture(scope="session", autouse=True)
@@ -231,4 +277,5 @@ __all__ = [
     "sample_pdf_bytes",
     "seeded_chunks",
     "async_session_maker",
+    "arq_pool_stub",
 ]

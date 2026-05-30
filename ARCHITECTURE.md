@@ -67,7 +67,7 @@ The backend runs on the host (not in compose) so the dev loop is as fast as poss
 
 **Postgres + pgvector** is the single source of truth for both relational data (documents, chunks, ingestion jobs, future user/session tables) and vector embeddings. Using one store instead of a dedicated vector DB keeps the deployment surface tiny and makes joins between metadata and embeddings trivial. The `vector` extension is enabled by `postgres/init/01-extensions.sql`, which Postgres runs once on first boot of an empty data volume.
 
-**Redis** holds ephemeral state. As of phase 3, that's per-session chat history (LIST per session, 30-day TTL, last 10 turn-pairs kept — see §4d). Future uses: SSE fan-out across replicas, rate limiting, and the eventual ingestion job queue. We keep it out of Postgres so we can blow away cache state without touching durable data.
+**Redis** holds ephemeral state. As of phase 3, that's per-session chat history (LIST per session, 30-day TTL, last 10 turn-pairs kept — see §4d) on **DB 0**. Phase 10 added the ARQ ingestion job queue on **DB 1** — the queue and chat state share the same Redis container but live in disjoint logical databases so `arq:*` keys never collide with `chat:user:*`. Future uses: SSE fan-out across replicas, rate limiting. We keep it out of Postgres so we can blow away cache state without touching durable data.
 
 ## 4a. Database schema
 
@@ -95,6 +95,7 @@ Two tables, defined in `backend/app/models.py`. **Schema is owned by Alembic** (
 - `source_type` — `'upload'` or `'scrape'`.
 - `source_uri` — filename for uploads, final URL for scrapes (after redirects).
 - `status` — `'processing' | 'completed' | 'failed'`. Lifecycle: starts `processing`, ends either `completed` (chunks + embeddings persisted) or `failed` (with `error` populated; partial chunks rolled back).
+- `stage` — phase 10. Finer-grained pipeline stage written by the ARQ worker: `'queued' → 'chunking' → 'embedding' → 'persisting' → 'completed' / 'failed'`. The UI polls `/ingest/{id}` and renders the value as a live progress label while `status === 'processing'`. Nullable: rows ingested before the `0003_add_document_stage` migration (phase 10) carry `NULL`.
 - `doc_metadata` — extractor-specific metadata (e.g. `{"format": "pdf", "page_count": 7}`).
 
 `document_chunks` — one row per chunk produced by the splitter.
@@ -106,17 +107,36 @@ Two tables, defined in `backend/app/models.py`. **Schema is owned by Alembic** (
 
 ## 4b. Ingestion pipeline
 
+Phase 10 split ingestion across two processes. The API route does the I/O-bound parse and hands off; an ARQ worker does the CPU-bound chunk + embed:
+
 ```
-   route                   services.parser              services.chunker              services.embeddings        services.ingest
-   ─────                   ───────────────              ────────────────              ───────────────────        ───────────────
-   POST /ingest/upload ──▶ parse_pdf / parse_text   ──▶ chunk_text                ──▶ StubEmbedding.embed_batch ──▶ persist Document + DocumentChunks
-   POST /ingest/scrape ──▶ fetch_url → parse_html   ──▶ (SentenceSplitter 512/128)    (deterministic 768-d)         (single transaction, status=completed)
+   request thread (API process)                                ARQ worker process
+   ───────────────────────────                                 ──────────────────
+   POST /ingest/upload  ──▶ parse_pdf / parse_text
+   POST /ingest/scrape  ──▶ fetch_url → parse_html
+                              │
+                              ▼
+                    create_pending_document()
+                    Document(status='processing', stage='queued') → COMMIT
+                              │
+                              ▼
+                    arq.enqueue_job('embed_document', document_id, text)
+                              │
+                              ▼
+                    return 202 + IngestStatus  ─────────────▶ stage='chunking' → COMMIT
+                                                              chunk_text(text)
+                                                              stage='embedding' → COMMIT
+                                                              HuggingFaceEmbeddingProvider.embed_batch()
+                                                              stage='persisting' → COMMIT
+                                                              bulk INSERT DocumentChunk rows
+                                                              status='completed', stage='completed' → COMMIT
 ```
 
-- **Parser** (`backend/app/services/parser.py`) — `pypdf` for PDFs, raw UTF-8 decode for TXT / MD, `httpx` + `BeautifulSoup(lxml)` for HTML (strips `script` / `style` / `noscript`, prefers `<main>` over `<body>`).
+- **Parser** (`backend/app/services/parser.py`) — `pypdf` for PDFs, raw UTF-8 decode for TXT / MD, `httpx` + `BeautifulSoup(lxml)` for HTML (strips `script` / `style` / `noscript`, prefers `<main>` over `<body>`). Stays in the request path because it's mostly I/O (`fetch_url`) or thread-bound (`pypdf`).
 - **Chunker** (`backend/app/services/chunker.py`) — LlamaIndex `SentenceSplitter(chunk_size=512, chunk_overlap=128)`. Parameters chosen for dense study material (UPSC guides, distributed-systems texts): small chunks keep retrieval precise; generous overlap preserves cross-paragraph context.
-- **Embedder** (`backend/app/services/embeddings.py`) — `EmbeddingProvider` Protocol with `HuggingFaceEmbeddingProvider` (phase 5) wrapping `sentence-transformers/all-mpnet-base-v2`. The model is lazy-loaded into a class-level singleton on first use (~420 MB cached to `~/.cache/huggingface/`). `model.encode(...)` is synchronous, so each call is wrapped in `asyncio.to_thread(...)` to keep the event loop free. Output is 768-d, normalized — matches the existing `vector(768)` pgvector column.
-- **Orchestrator** (`backend/app/services/ingest.py`) — single-transaction `ingest_parsed()`. On exception: rollback the chunks, then write a `status='failed'` row carrying the error so the caller can still poll `/ingest/{id}`.
+- **Embedder** (`backend/app/services/embeddings.py`) — `EmbeddingProvider` Protocol with `HuggingFaceEmbeddingProvider` (phase 5) wrapping `sentence-transformers/all-mpnet-base-v2`. The model is lazy-loaded into a class-level singleton on first use (~420 MB cached to `~/.cache/huggingface/`). Phase 10 moved this load into the worker process: the API process never imports the model weights, so `/chat` SSE latency is unaffected by concurrent ingest load.
+- **Orchestrator** (`backend/app/services/ingest.py`) — `create_pending_document()` (request path) writes the queued row and commits; `embed_pending_document()` (worker path) advances `stage` between every step and commits on each transition so a polling client sees live progress at <1.5 s lag. `ingest_parsed()` is kept as a thin sequential wrapper for backward-compat callers (tests, future CLI tools).
+- **Worker entrypoint** (`backend/app/workers/ingest_worker.py`) — `embed_document(ctx, document_id, text)` is the ARQ job; `WorkerSettings` is the CLI entry (`arq app.workers.ingest_worker.WorkerSettings`). `max_tries=1` — embedding is non-idempotent, so a crashed worker leaves the row at whatever stage was last committed; the recovery path is re-upload, not automatic retry.
 
 ## 4c. Agents & orchestration (LangGraph)
 
@@ -171,14 +191,14 @@ OpenAPI 3.1 spec is served at `/openapi.json`; Swagger UI at `/docs`; ReDoc at `
 | Method | Path                       | Tag       | Purpose                                                      | Status            |
 |--------|----------------------------|-----------|--------------------------------------------------------------|-------------------|
 | GET    | `/health`                  | health    | Liveness + Postgres + Redis dependency check.                | implemented       |
-| POST   | `/ingest/upload`           | ingest    | Upload a PDF / TXT / MD file; parse → chunk → embed → save. Writes the verified Clerk user id onto the new `documents.user_id` column (phase 9). | implemented       |
-| POST   | `/ingest/scrape`           | ingest    | Fetch a URL with httpx, extract text via BeautifulSoup. Writes the verified Clerk user id onto `documents.user_id`. | implemented       |
-| GET    | `/ingest/{ingestion_id}`   | ingest    | Poll ingestion status + chunk count. Phase 9: filters by `user_id == caller OR user_id IS NULL` so legacy unowned polls still work; cross-user polls of newly owned ids return 404. | implemented       |
+| POST   | `/ingest/upload`           | ingest    | Phase 10: parses the upload, persists a `processing/queued` row, enqueues an ARQ job, returns **202 Accepted** immediately. Writes the verified Clerk user id onto `documents.user_id`. | implemented       |
+| POST   | `/ingest/scrape`           | ingest    | Phase 10: same shape — fetches + parses, persists queued row, enqueues, returns **202**. | implemented       |
+| GET    | `/ingest/{ingestion_id}`   | ingest    | Poll ingestion status + `stage` + chunk count. Phase 9: filters by `user_id == caller OR user_id IS NULL` so legacy unowned polls still work; cross-user polls of newly owned ids return 404. Phase 10 added the `stage` field. | implemented       |
 | GET    | `/documents`               | documents | List the caller's ingested documents (id, source, title, status, chunk count, created_at). Ordered most-recent-first. Phase 9. | implemented       |
 | DELETE | `/documents/{id}`          | documents | Delete a document the caller owns (cascades to chunks). Returns 204 on success, 404 for missing or other-user-owned ids (existence not leaked across users). Phase 9. | implemented       |
 | POST   | `/chat`                    | chat      | Session-aware. **Token-level** SSE from Gemini; `X-Session-Id` header on response. | implemented |
 
-Ingestion runs synchronously inside the request handler — the response carries the final status (`completed` or `failed`) and the chunk count. Moving to a Redis-backed worker is a later follow-up; the API contract is forward-compatible.
+Ingestion is **async** as of phase 10. The route returns 202 Accepted with `status="processing", stage="queued"` and hands the work off to an ARQ worker (`app.workers.ingest_worker.WorkerSettings`); the client polls `GET /ingest/{id}` until `status == "completed"` or `"failed"`. The `stage` field reports the live worker phase. See §4b for the topology.
 
 ## 6. Streaming protocol (`POST /chat`)
 
@@ -252,7 +272,10 @@ The Playwright suite (`frontend/e2e/`) runs against the live Next.js dev server 
 | Prompt-eval suite          | offline evaluation harness for Tutor citation accuracy and Quiz format compliance |
 | Tuning the HNSW search-time `ef_search` parameter for the recall/latency knob (phase 6 added the index with default build params) | runtime `SET LOCAL hnsw.ef_search = N` in `retrieve_top_k` |
 | Grading + difficulty adaptation | `agents/quiz.py` mutating `state.user_score`; persisted per-session |
-| Background ingestion       | move `ingest_parsed` behind a Redis-backed worker (Arq) |
+| **Worker horizontal scaling** | phase 10 ships one worker process; multi-worker / multi-host scale-out (and a queue-depth metric) is a future concern |
+| **Move parsing into the worker** | PDF parsing still runs inside the request handler; large files block until the parse completes. Persisting raw bytes (`Document.raw_bytes` blob or filesystem handoff) would push the parse onto the worker too |
+| **Job cancellation + retry UI** | `max_tries=1` and no cancellation endpoint; a crashed worker leaves the row at whatever stage was last committed and a re-upload is the only recovery path |
+| **Stuck-job reaper** | a worker startup task that finds rows in `status='processing'` for >10 minutes and marks them `failed` with a "worker crashed" error |
 | Multi-page scraping        | honour `ScrapeRequest.max_depth` (currently ignored)  |
 | CI                         | `.github/workflows/`                                  |
 

@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { toast } from "sonner";
 
-import { deleteDocument, listDocuments, type Document } from "@/lib/admin";
+import { deleteDocument, listDocuments, type Document, type IngestStage } from "@/lib/admin";
 import { useBackendToken } from "@/lib/auth-token";
 
 type Props = {
@@ -29,27 +29,94 @@ function displayTitle(doc: Document): string {
   return doc.source_uri;
 }
 
+const STAGE_LABEL: Record<IngestStage, string> = {
+  queued: "Queued",
+  chunking: "Chunking…",
+  embedding: "Embedding…",
+  persisting: "Saving…",
+  completed: "Ready",
+  failed: "Failed",
+};
+
+function StatusBadge({ doc }: { doc: Document }) {
+  if (doc.status === "completed") {
+    return (
+      <span
+        className="rounded-full bg-green-100 px-2 py-0.5 text-xs font-medium text-green-700 dark:bg-green-950 dark:text-green-300"
+        data-testid="documents-status"
+        data-status="completed"
+      >
+        Ready
+      </span>
+    );
+  }
+  if (doc.status === "failed") {
+    return (
+      <span
+        className="rounded-full bg-red-100 px-2 py-0.5 text-xs font-medium text-red-700 dark:bg-red-950 dark:text-red-300"
+        data-testid="documents-status"
+        data-status="failed"
+      >
+        Failed
+      </span>
+    );
+  }
+  // processing — surface the live stage label when we have one
+  const label = doc.stage ? STAGE_LABEL[doc.stage] : "Processing…";
+  return (
+    <span
+      className="rounded-full bg-blue-100 px-2 py-0.5 text-xs font-medium text-blue-700 dark:bg-blue-950 dark:text-blue-300"
+      data-testid="documents-status"
+      data-status="processing"
+      data-stage={doc.stage ?? ""}
+    >
+      {label}
+    </span>
+  );
+}
+
 export function DocumentsTable({ refreshKey }: Props) {
   const [docs, setDocs] = useState<Document[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const getToken = useBackendToken();
 
-  const fetchDocs = useCallback(async () => {
+  const fetchDocs = useCallback(async (): Promise<Document[]> => {
     setLoading(true);
     setError(null);
     try {
       const rows = await listDocuments(getToken);
       setDocs(rows);
+      return rows;
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
+      return [];
     } finally {
       setLoading(false);
     }
   }, [getToken]);
 
   useEffect(() => {
-    void fetchDocs();
+    // Phase 10 — auto-poll while any row is in-flight. The fetch cycles every
+    // 1.5s; once no row reports `status === "processing"` we stop. Effect
+    // cleanup cancels any pending tick so route changes / unmounts don't leak.
+    let cancelled = false;
+    let timeoutId: ReturnType<typeof setTimeout> | null = null;
+
+    const tick = async () => {
+      if (cancelled) return;
+      const rows = await fetchDocs();
+      if (cancelled) return;
+      if (rows.some((d) => d.status === "processing")) {
+        timeoutId = setTimeout(() => void tick(), 1500);
+      }
+    };
+
+    void tick();
+    return () => {
+      cancelled = true;
+      if (timeoutId) clearTimeout(timeoutId);
+    };
   }, [fetchDocs, refreshKey]);
 
   const confirmDelete = useCallback(
@@ -133,6 +200,7 @@ export function DocumentsTable({ refreshKey }: Props) {
               <tr>
                 <th className="px-2 py-2 font-medium">Title</th>
                 <th className="px-2 py-2 font-medium">Source</th>
+                <th className="px-2 py-2 font-medium">Status</th>
                 <th className="px-2 py-2 font-medium">Chunks</th>
                 <th className="px-2 py-2 font-medium">Added</th>
                 <th className="px-2 py-2 font-medium"></th>
@@ -152,6 +220,7 @@ export function DocumentsTable({ refreshKey }: Props) {
                   <td className="px-2 py-3 text-xs uppercase tracking-wide text-zinc-500">
                     {doc.source_type}
                   </td>
+                  <td className="px-2 py-3"><StatusBadge doc={doc} /></td>
                   <td className="px-2 py-3 tabular-nums">{doc.chunk_count}</td>
                   <td className="px-2 py-3 text-xs text-zinc-500">{formatDate(doc.created_at)}</td>
                   <td className="px-2 py-3 text-right">

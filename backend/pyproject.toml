@@ -25,6 +25,7 @@ dependencies = [
     "sentence-transformers>=2.7.0",
     "alembic>=1.13",
     "pyjwt[crypto]>=2.9",
+    "arq>=0.26",
 ]
 
 [dependency-groups]

@@ -37,6 +37,7 @@ async def list_documents(
             Document.source_uri,
             Document.title,
             Document.status,
+            Document.stage,
             Document.created_at,
             chunk_count,
         )
@@ -53,6 +54,7 @@ async def list_documents(
             source_uri=row.source_uri,
             title=row.title,
             status=row.status,
+            stage=row.stage,
             chunk_count=int(row.chunk_count or 0),
             created_at=row.created_at,
         )

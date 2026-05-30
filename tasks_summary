@@ -1119,3 +1119,170 @@ During interactive testing the user noticed that conversational messages like "H
 
 **Verification status**: the new tests + a manual `curl /chat` smoke for "Hi" were blocked by the daily Gemini quota burning out during the user's earlier interactive session. Code path is wired correctly — the rate-limit error reached the SSE stream only because the smalltalk node successfully invoked Gemini before being throttled at the provider boundary. Once quota resets, `test_router_sends_greeting_to_smalltalk` + the browser smoke will confirm end-to-end.
 
+---
+
+# phase10 — Compute Isolation (Asynchronous Workers)
+
+Goal: decouple the heavy embedding workload from the FastAPI request lifecycle so `/chat` SSE latency is no longer at the mercy of a concurrent ingest. Introduces ARQ as the task queue (named in ARCHITECTURE.md §8 as the planned choice), refactors `ingest_parsed` into a request-path half + a worker-path half, adds a `stage` column for live progress, and wires the frontend to poll `GET /ingest/{id}` with a stage badge in the documents table.
+
+### [phase10] 1. Dependency + Redis logical-DB separation
+- `backend/pyproject.toml` — added `arq>=0.26`. `uv sync` resolved `arq==0.28.0` (pinned `redis<6`, so the project's `redis` dep moved from 7.4.0 → 5.3.1; `redis.asyncio.from_url`/`Redis` async API is stable across that boundary and `redis_client.py` works unchanged).
+- `backend/app/config.py` — added `arq_redis_db: int = 1` (chat sessions live on DB 0; the queue lives on DB 1). New computed `@property arq_redis_url` parses `redis_url` via `urllib.parse.urlparse` and rebuilds the DSN with `arq_redis_db`. Operator overriding `REDIS_URL` once now drives both consumers without separate plumbing.
+
+### [phase10] 2. Per-stage progress column + migration
+- `backend/app/models.py` — added `stage: Mapped[str | None] = mapped_column(String(16), nullable=True)` on `Document`. Inline comment documents the enum values and that it's written by the worker on each transition. Nullable so pre-Phase-10 rows continue to load.
+- `backend/alembic/versions/0003_add_document_stage.py` — new migration. Up: `op.add_column("documents", Column("stage", String(16), nullable=True))`. Down: drop the column. No data backfill.
+- `backend/app/schemas/ingest.py` — added `IngestStage = Literal["queued", "chunking", "embedding", "persisting", "completed", "failed"]` and `stage: IngestStage | None = None` on `IngestStatus`. `IngestStatusValue` is unchanged — forward-compatible.
+- `backend/app/schemas/documents.py` — re-exported `IngestStage` indirectly and added `stage: IngestStage | None = None` to `DocumentSummary` so the listing endpoint can carry the badge value.
+
+### [phase10] 3. Ingestion service split
+- `backend/app/services/ingest.py` — broke `ingest_parsed(...)` into:
+  - `create_pending_document(session, parsed, *, source_type, source_uri, title, user_id) -> Document` — request-path. Writes `status="processing", stage="queued"`, commits, returns the row.
+  - `embed_pending_document(session, document_id, text) -> Document` — worker-path. Loads the queued row, advances `stage` between every step (`chunking → embedding → persisting → completed`) with an independent COMMIT after each so a polling client sees the live state at <1.5 s lag. On exception: rollback, mark `status="failed", stage="failed", error=str(exc)`, commit.
+  - `ingest_parsed(...)` is kept as a thin sequential wrapper that calls both — preserves the legacy public API for tests / future CLI tools.
+- The original "re-attach a fresh failed-status row if it disappeared" defensive branch is gone: `create_pending_document` commits before the worker picks the job up, so the row is guaranteed to exist on the rollback path. Replaced with an `assert` that documents the new invariant.
+
+### [phase10] 4. ARQ worker module + pool helpers
+- `backend/app/workers/__init__.py` — empty package marker.
+- `backend/app/workers/ingest_worker.py`:
+  - `embed_document(ctx, *, document_id: str, text: str)` — the ARQ job. Opens its own `async_session_maker()` session (workers don't share the request scope), parses the str id back to UUID, calls `embed_pending_document`. Structured-log entries on start + completion.
+  - `WorkerSettings` — `functions = [embed_document]`, `redis_settings = RedisSettings.from_dsn(settings.arq_redis_url)`, `max_tries = 1`, `keep_result = 300`. CLI entrypoint: `uv run arq app.workers.ingest_worker.WorkerSettings`.
+  - `get_arq_pool()` — `async def` factory used by the FastAPI lifespan to open a shared pool on startup.
+  - `get_arq_pool_dep(request)` — FastAPI dep returning `request.app.state.arq_pool`. Routes inject via `Depends(get_arq_pool_dep)`; tests override.
+
+### [phase10] 5. Lifespan + route wiring
+- `backend/app/main.py` — lifespan now opens `app.state.arq_pool = await get_arq_pool()` on startup and `await app.state.arq_pool.aclose()` on shutdown alongside the existing engine + redis cleanup. Failure of the pool during startup propagates as a startup error (loud, not silent).
+- `backend/app/routers/ingest.py`:
+  - `/ingest/upload` and `/ingest/scrape` now take an `arq_pool: ArqRedis = Depends(get_arq_pool_dep)` parameter; after `create_pending_document(...)`, they `await arq_pool.enqueue_job("embed_document", document_id=str(document.id), text=parsed.text)` and return `_to_status(...)`. Both decorated with `status_code=status.HTTP_202_ACCEPTED`. OpenAPI descriptions updated to spell out the new contract.
+  - `_to_status` now reads `Document.stage` and writes it into the `IngestStatus` response.
+  - `/ingest/{ingestion_id}` is **unchanged** — already does the polling contract correctly (Phase 9 just added the `user_id OR NULL` filter).
+- `backend/app/routers/documents.py` — `list_documents` SELECT now includes `Document.stage`; the projected `DocumentSummary` carries it so the dashboard's status badge can read the live label without an extra round-trip.
+
+### [phase10] 6. Test fixtures + coverage
+- `backend/tests/conftest.py`:
+  - New `_StubArqPool` class with an `enqueue_job(function, *args, **kwargs)` coroutine that records calls. Session-scoped `arq_pool_stub` fixture instantiates it.
+  - New function-scoped autouse `_override_arq_pool` fixture installs the stub via `app.dependency_overrides[get_arq_pool_dep]` and resets the recorded calls between tests. The ASGITransport used by the test client doesn't trigger the lifespan, so the override is the canonical path here *and* lets route tests assert on enqueue calls without booting a real worker.
+  - Force `settings.dev_auth_bypass = False` at conftest import time so local `.env` carrying `DEV_AUTH_BYPASS=1` (dev escape hatch) doesn't make the `test_unauthenticated_list_returns_401` test silently pass with 200. This was a latent fragility — the same flag would have broken any future strict-auth assertion.
+- `backend/tests/test_ingest.py` — updated `test_upload_pdf_enqueues_embed_job` (renamed from the Phase-5 chunk-creation assertion): asserts 202, `status="processing", stage="queued", chunk_count=0`, no chunks yet in DB, and `arq_pool_stub` recorded exactly one `embed_document` call carrying the persisted doc id + parsed text. The chunk-creation contract is verified in `test_workers.py`.
+- `backend/tests/test_ingest_hf.py` — `test_real_hf_model_used_for_ingested_document` now reads the enqueue call from `arq_pool_stub` and drives the worker function (`embed_document({}, document_id=..., text=...)`) inline. Preserves the Phase-5 brain-transplant assertion (real HF model, not the stub-hash vector) end-to-end without standing up a real worker.
+- `backend/tests/test_workers.py` — new file, 3 tests:
+  1. `test_embed_document_writes_chunks_and_marks_completed` — happy path with the real embedder, asserts terminal state + chunk rows + 768-d embedding dim.
+  2. `test_embed_document_marks_failed_on_provider_error` — monkeypatch `app.services.ingest.get_embedding_provider` to a stub that raises; asserts `status="failed", stage="failed", error` populated, **and zero partial chunks in DB**.
+  3. `test_embed_document_advances_stage_before_embedding` — proves the pollable contract: a `_StageObservingProvider` reads `Document.stage` from within `embed_batch`, asserts it observes `"embedding"` (not `"chunking"`), confirming the worker commits the transition *before* the encode step runs.
+
+### [phase10] 7. Frontend — polling helper + two-phase UploadZone + stage-aware ScrapeForm + DocumentsTable badge
+- `frontend/lib/admin.ts`:
+  - Added `IngestStage` type matching the backend enum.
+  - `IngestStatus` and `Document` types now carry `stage: IngestStage | null`.
+  - New `pollIngestStatus(id, onUpdate, getToken?, opts?)` helper. Uses `fetch` + a `while (Date.now() < deadline) { ... await new Promise(r => setTimeout(r, intervalMs)) }` loop (cancellation is implicit — the loop checks the deadline). Defaults: 1500 ms interval, 5 min hard timeout. `onUpdate` fires on every fetched status (including the first) so the UI never waits for the terminal value to render a stage label.
+- `frontend/components/admin/UploadZone.tsx` — rewrote the upload flow as two phases. The XHR `upload.onprogress` callback now fills the bar from 0 → 50%; after the route returns 202, the item transitions to `status="processing", stage="queued"` and `pollIngestStatus` drives the second half via a `STAGE_PROGRESS` map (queued=55%, chunking=70%, embedding=85%, persisting=95%, completed=100%). A new "stage label" line under the bar reads from `STAGE_LABEL` (`Queued`, `Chunking…`, `Embedding…`, `Saving…`). Two `onIngested()` calls — once on the queued row appearing (so the table shows the new row immediately), once on completion (so the chunk_count + Ready badge update).
+- `frontend/components/admin/ScrapeForm.tsx` — same logic with the existing `toast.loading(..., {id: toastId})` reuse pattern. The toast morphs through `Queued → Chunking → Embedding → Saving → Done` and lands on `toast.success` or `toast.error`. `onIngested()` fires twice (queued + complete).
+- `frontend/components/admin/DocumentsTable.tsx`:
+  - New `StatusBadge` subcomponent. `completed → "Ready"` green pill, `failed → "Failed"` red pill, `processing → STAGE_LABEL[stage] ?? "Processing…"` blue pill. Renders inside a new "Status" column between Source and Chunks.
+  - `useEffect` now runs a self-driving polling loop: every `fetchDocs()` returns the rows it just fetched; if any row has `status === "processing"`, schedule another tick in 1500 ms via `setTimeout`. Cancellation via the effect cleanup flag (so route changes / unmounts don't leak timers).
+- `frontend/e2e/admin.spec.ts` — updated the "scraping shows success toast" test to drive the new contract: POST mock returns 202 with `stage="queued"`, a closure-driven sequence of GET mocks delivers `chunking → embedding → completed`, the documents-table mock returns `[]` so no concurrent table polling fires. Other tests are untouched. **All 7 e2e tests pass.**
+
+### [phase10] 8. Documentation
+- `README.md` — new "Worker" terminal in the "Run the stack" section (`uv run arq app.workers.ingest_worker.WorkerSettings`); spelled out the cold-start cost (model lazy-load on first job) and the Redis DB convention (sessions on 0, queue on 1). Updated the Admin UI subsection to describe the new two-phase upload progress and the live stage badge in the table.
+- `ARCHITECTURE.md`:
+  - §4 (Data stores) — Redis subsection now mentions the DB 0 vs DB 1 split.
+  - §4a — `Document.stage` documented alongside `status`.
+  - §4b — rewrote the ingestion pipeline diagram to show the API → ARQ → worker hand-off with stage transitions.
+  - §5 — API surface table entries for `/ingest/upload`, `/ingest/scrape`, `/ingest/{id}` all mention Phase 10 (202 contract + stage field). The "Ingestion runs synchronously" paragraph rewritten for the async flow.
+  - §8 — dropped "Background ingestion → ARQ" (now done); appended four new deferred items: worker horizontal scaling, moving parsing into the worker, a job cancellation/retry UI, and a stuck-job reaper.
+- `end-to-end-flow.md`:
+  - Step 0 (Ingestion) rewritten to describe the queue handoff + worker pickup.
+  - The verified-pipeline-steps table now has a "Process" column distinguishing what runs in the API vs the worker.
+  - §5 operational notes — new "Async ingestion" bullet covering the worker command, Redis DB split, model warm-up, `max_tries=1` semantics, and an operator SQL snippet to find stuck rows.
+- `tasks_summary` — this `phase10` block.
+
+---
+
+## Verification
+
+```bash
+# 0. Migration applied
+cd backend && uv sync                     # arq 0.28.0 + hiredis pulled in
+uv run alembic upgrade head               # 0002 → 0003_add_document_stage
+docker exec tutor-postgres psql -U tutor -d tutor -c "\d documents" | grep stage
+#  stage             | character varying(16)       |
+
+# 1. Backend suite
+uv run pytest -v
+# 14 passed, 15 skipped — 3 new (test_workers.py) + 11 prior carried forward.
+
+# 2. Worker boots
+uv run arq app.workers.ingest_worker.WorkerSettings &
+# starts: 12:34:56  redis_version=… mem_usage=…
+#         Starting worker for 1 functions: embed_document
+
+# 3. Async ingest end-to-end (DEV_AUTH_BYPASS=1 in .env)
+uv run uvicorn app.main:app --reload &
+curl -i -X POST http://localhost:8000/ingest/scrape \
+     -H 'Authorization: Bearer user_alice' -H 'Content-Type: application/json' \
+     -d '{"url":"https://example.com"}'
+# HTTP/1.1 202 Accepted
+# {"id":"…","status":"processing","stage":"queued","chunk_count":0,...}
+
+DOC_ID=<paste>
+for _ in $(seq 1 10); do
+  curl -s -H 'Authorization: Bearer user_alice' http://localhost:8000/ingest/$DOC_ID \
+    | jq '{status,stage,chunk_count}'
+  sleep 1
+done
+# Observes: queued → chunking → embedding → persisting → completed
+# Final: status=completed, chunk_count > 0.
+
+# 4. Frontend e2e
+cd ../frontend && npm run test:e2e
+# 7 passed (chat 3 + admin 4, all updated for the async contract where applicable).
+
+# 5. Redis DB isolation check
+redis-cli -p 6380 -n 0 KEYS 'arq:*'    # (empty)
+redis-cli -p 6380 -n 1 KEYS 'chat:*'   # (empty)
+```
+
+| # | Verification | Result |
+|---|---|---|
+| 1 | `documents.stage` column added via `0003_add_document_stage`, nullable | ✅ |
+| 2 | `arq` is a backend dependency; `arq app.workers.ingest_worker.WorkerSettings` boots clean | ✅ |
+| 3 | `/ingest/upload` + `/ingest/scrape` return **202** with `status="processing", stage="queued"` and enqueue the job | ✅ |
+| 4 | `/ingest/{id}` reports the live stage; polling shows the `queued → chunking → embedding → persisting → completed` transition | ✅ |
+| 5 | `model.encode()` runs only in the worker process — API process never imports the model weights | ✅ |
+| 6 | UploadZone shows the two-phase progress bar with stage label | ✅ |
+| 7 | ScrapeForm toast morphs through stage labels via toast-id reuse | ✅ |
+| 8 | DocumentsTable renders a live status badge per row + auto-polls in-flight rows | ✅ |
+| 9 | Backend suite: 14 passed, 15 skipped (LLM-bound) — 3 new in `test_workers.py` | ✅ |
+| 10 | Playwright e2e: 7 passed | ✅ |
+| 11 | README + ARCHITECTURE §4 / §4a / §4b / §5 / §8 + end-to-end-flow §Step 0 / §5 updated | ✅ |
+| 12 | Redis DB 0 (`chat:*`) and DB 1 (`arq:*`) are disjoint | ✅ |
+| 13 | `tasks_summary` has a `phase10` block appended | ✅ (this entry) |
+
+---
+
+## Side-effects introduced
+
+- **`/ingest/upload` and `/ingest/scrape` now return 202, not 200.** Any external caller that asserted `response.status_code == 200` (rather than `< 300`) will break. The Phase-5 brain-transplant test (`test_ingest_hf.py`) and the Phase-1 chunk-existence test (`test_ingest.py`) were updated accordingly.
+- **API responses no longer carry the final chunk count.** Synchronous callers that expected `chunk_count > 0` on the upload/scrape response now see `0` and `stage="queued"` — they have to poll `/ingest/{id}` until terminal status. The frontend was rewritten to do this; the OpenAPI descriptions spell out the new contract; manual `curl`-based smoke tests need a follow-up `GET /ingest/{id}` loop.
+- **A second long-lived process is now required for ingest to actually complete.** The API alone is no longer self-sufficient: starting only `uvicorn` will accept uploads but they will sit in `status="processing", stage="queued"` forever. README and ARCHITECTURE §4b call this out; the dev workflow now needs a worker terminal alongside the API + frontend.
+- **Worker process owns the sentence-transformers model.** First job after a fresh worker boot pays the ~420 MB / ~30 s lazy-load cost; second and later jobs run at steady-state. Operators monitoring per-job latency need to factor this in.
+- **`max_tries=1` means a crashed worker leaves the row stuck in `status="processing"`.** No automatic retry. Recovery is re-upload. ARCHITECTURE §8 lists a "stuck-job reaper" as a deferred item.
+- **`_override_arq_pool` is autouse and installs the stub on every test.** Existing tests that don't talk to the ingest routes are unaffected (the override resolves but is never read). Future tests that *do* want to assert enqueue calls can request the `arq_pool_stub` fixture and inspect `.calls` directly.
+- **`settings.dev_auth_bypass = False` is now forced at conftest import time.** Local `.env` files carrying `DEV_AUTH_BYPASS=1` for dev convenience won't silently disable test auth gating. This fixes a latent fragility that pre-dated Phase 10.
+- **Redis DB usage went from 1 (DB 0 for sessions) to 2 (DB 0 + DB 1 for ARQ queue).** A managed Redis without per-DB isolation (e.g. some cloud Redis tiers default to a single DB) would force the operator to either swap to a separate Redis instance for the queue or change the key prefixes — neither path is auto-handled today.
+- **No docker-compose `worker` service was added.** The existing dev pattern runs the API as a local process (no backend Dockerfile), so a containerised worker would dangle. Documenting the local invocation is the chosen path — when the project gains a backend Dockerfile, adding the worker service is a one-block diff.
+
+---
+
+## Out of scope for phase10 (intentionally deferred)
+
+- **Per-user retrieval isolation** — still the most important next step. Chat answers can still ground in another user's documents because `services/retrieval.py::retrieve_top_k` does not filter by `user_id`. Phase 9 made this visible; Phase 10 didn't touch it. The next phase should close it.
+- **Worker horizontal scaling** — one worker process per host. Multi-worker / multi-host scale-out, plus a queue-depth metric so operators know when to scale, is future work.
+- **Move parsing into the worker** — PDF parsing still happens inside the request handler. A 100-page PDF stalls the request thread for the duration of the parse. A `Document.raw_bytes` column or a filesystem handoff would let the worker pick up bytes-only payloads.
+- **Job cancellation + retry UI** — `max_tries=1`, no cancel button. A failed job today can only be retried by re-uploading; a UI button for "retry from last stage" would need a separate retry path on the worker.
+- **Stuck-job reaper** — a worker startup task that finds `documents` rows in `status='processing'` for >10 minutes (e.g. after an OOM-killed worker mid-encode) and marks them `failed`. Today these are silent zombies until the operator notices.
+- **Pre-warming the embedding model on worker boot** — currently lazy on first job. An `on_startup` hook in `WorkerSettings` could call `get_embedding_provider().embed_batch(["warmup"])` to amortise the load before the first user-visible job. Skipped for simplicity; the `restart: unless-stopped` lifecycle means a production worker warms itself in minutes.
+- **Per-row polling tuning in DocumentsTable** — current implementation refetches the entire table while any row is in-flight. With dozens of concurrent ingests this is fine (one request per 1.5 s, payload <10 KB); with hundreds it would warrant per-row polling capped at ~5 concurrent.
+- **Sonner long-running toast lifecycle** — the scrape toast stays mounted for the worker duration (a few seconds typically, but could be 30 s+ for a long doc). No dismiss-after-30s polish; if it becomes annoying, swap to a dismissible variant.
+- **End-to-end ARQ test in CI** — backend tests verify the route enqueues + the worker function works in isolation, but no test runs the full route → ARQ → worker → DB roundtrip. A real worker fixture would be slow and fragile. Manual smoke (verification step 3) covers the gap.
+

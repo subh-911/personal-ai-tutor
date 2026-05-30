@@ -59,6 +59,23 @@ uv run alembic upgrade head     # idempotent; safe to re-run
 uv run uvicorn app.main:app --reload
 ```
 
+**Worker** (Phase 10 — runs the heavy embedding work off the API thread):
+
+```bash
+cd backend
+uv run arq app.workers.ingest_worker.WorkerSettings
+```
+
+The worker process loads the sentence-transformers model lazily on the first
+job; expect a ~30 s cold-start the first time you ingest after restarting the
+worker, then steady-state speed thereafter. It uses Redis DB **1** (sessions
+live in DB **0**) so the queue and chat state never collide. Inspect with:
+
+```bash
+redis-cli -p 6380 -n 1 KEYS 'arq:*'   # in-flight jobs
+docker logs -f tutor-redis            # broker events
+```
+
 **Frontend** (`http://localhost:3000`):
 
 ```bash
@@ -79,10 +96,10 @@ Try:
 There's a small Admin · Ingestion page for feeding documents into the corpus without leaving the browser:
 
 1. Open <http://localhost:3000/admin> (or click **Admin · ingestion** from the landing page).
-2. **Upload files** — drag-and-drop PDFs, plain-text, or Markdown files onto the dashed zone (or click it to pick from disk). A per-file progress bar shows upload progress; a success toast reports the chunk count when ingestion finishes.
-3. **Scrape a URL** — paste a public article URL (e.g. a system-design write-up) and click **Scrape**. The backend fetches the page, extracts the main text via BeautifulSoup, and runs the full ingestion pipeline. A success or error toast appears when the call returns.
+2. **Upload files** — drag-and-drop PDFs, plain-text, or Markdown files onto the dashed zone (or click it to pick from disk). A two-phase progress bar shows the wire upload first, then the worker's live stage (`chunking → embedding → saving`); a success toast reports the chunk count when ingestion finishes.
+3. **Scrape a URL** — paste a public article URL (e.g. a system-design write-up) and click **Scrape**. The backend fetches the page, extracts the main text via BeautifulSoup, and enqueues the chunk + embed work onto the ARQ worker. The toast morphs through stage labels (`Fetching → Chunking → Embedding → Saving`) and lands on success or failure.
 
-Both flows talk to the existing `POST /ingest/upload` and `POST /ingest/scrape` endpoints; nothing else is required.
+Both flows talk to `POST /ingest/upload` and `POST /ingest/scrape`. Phase 10 made these **202 Accepted** routes — they return immediately with a `processing/queued` row, and the client polls `GET /ingest/{id}` until the worker reports `completed` or `failed`. The **Your knowledge base** table below shows live stage badges (`Queued → Chunking → Embedding → Saving → Ready`) per row.
 
 ### Knowledge base management
 

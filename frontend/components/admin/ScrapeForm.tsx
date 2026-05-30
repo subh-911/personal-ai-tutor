@@ -3,11 +3,20 @@
 import { useState, type FormEvent } from "react";
 import { toast } from "sonner";
 
-import { scrapeUrl } from "@/lib/admin";
+import { pollIngestStatus, scrapeUrl, type IngestStage } from "@/lib/admin";
 import { useBackendToken } from "@/lib/auth-token";
 
 type ScrapeFormProps = {
   onIngested?: () => void;
+};
+
+const STAGE_TOAST: Record<IngestStage, string> = {
+  queued: "Queued for embedding…",
+  chunking: "Chunking text…",
+  embedding: "Embedding chunks…",
+  persisting: "Saving vectors…",
+  completed: "Done",
+  failed: "Failed",
 };
 
 export function ScrapeForm({ onIngested }: ScrapeFormProps = {}) {
@@ -21,17 +30,34 @@ export function ScrapeForm({ onIngested }: ScrapeFormProps = {}) {
     if (!trimmed) return;
 
     setSubmitting(true);
-    const toastId = toast.loading(`Scraping ${trimmed}…`);
+    const toastId = toast.loading(`Fetching ${trimmed}…`);
     try {
-      const result = await scrapeUrl(trimmed, getToken);
-      toast.success(
-        `Scraped "${result.title ?? trimmed}" — ${result.chunk_count} chunk${
-          result.chunk_count === 1 ? "" : "s"
-        }`,
-        { id: toastId },
-      );
-      setUrl("");
+      const accepted = await scrapeUrl(trimmed, getToken);
+      // Notify the parent immediately so DocumentsTable shows the queued row.
       onIngested?.();
+      toast.loading(STAGE_TOAST.queued, { id: toastId });
+
+      const final = await pollIngestStatus(
+        accepted.id,
+        (s) => {
+          if (s.stage) toast.loading(STAGE_TOAST[s.stage], { id: toastId });
+        },
+        getToken,
+      );
+
+      if (final.status === "completed") {
+        toast.success(
+          `Scraped "${final.title ?? trimmed}" — ${final.chunk_count} chunk${
+            final.chunk_count === 1 ? "" : "s"
+          }`,
+          { id: toastId },
+        );
+        setUrl("");
+        onIngested?.();
+      } else {
+        toast.error(`Scrape failed: ${final.error ?? "worker reported failure"}`, { id: toastId });
+        onIngested?.();
+      }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       toast.error(`Scrape failed: ${message}`, { id: toastId });
@@ -48,7 +74,7 @@ export function ScrapeForm({ onIngested }: ScrapeFormProps = {}) {
       <h2 className="mb-3 text-lg font-semibold">Scrape a URL</h2>
       <p className="mb-4 text-sm text-zinc-600 dark:text-zinc-400">
         Paste a public article URL — the server fetches the page, extracts the main text via BeautifulSoup,
-        and runs the full ingestion pipeline.
+        and queues chunk + embed work onto a background worker.
       </p>
       <form onSubmit={onSubmit} className="flex flex-col gap-3">
         <label className="flex flex-col gap-1 text-sm">

@@ -25,6 +25,11 @@ class Document(Base):
     source_uri: Mapped[str] = mapped_column(Text, nullable=False)
     title: Mapped[str | None] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="processing")
+    # Phase 10 — finer-grained pipeline stage. Written by the ARQ worker on each
+    # transition: queued → chunking → embedding → persisting → completed/failed.
+    # `status` stays the coarse processing/completed/failed enum for backward compat;
+    # `stage` is read by the UI to surface live progress while a job is in flight.
+    stage: Mapped[str | None] = mapped_column(String(16), nullable=True)
     error: Mapped[str | None] = mapped_column(Text)
     doc_metadata: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict, server_default="{}")
     created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now(), nullable=False)
