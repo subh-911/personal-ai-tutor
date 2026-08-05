@@ -12,8 +12,8 @@ Two diagrams up top (high-level + request lifecycle); then a layer-by-layer walk
 flowchart TB
     subgraph Browser["Browser (Next.js 16 + React 19 + Tailwind 4)"]
         Landing["/ (landing)"]
-        Admin["/admin<br/>(drag-drop + URL scrape)"]
-        Chat["/chat<br/>(SSE consumer + Markdown render)"]
+        Admin["/admin<br/>drag-drop + URL scrape"]
+        Chat["/chat<br/>SSE consumer + Markdown render"]
     end
 
     subgraph Backend["FastAPI backend (uvicorn :8000)"]
@@ -21,17 +21,17 @@ flowchart TB
         ChatRouter["routers/chat.py<br/>POST /chat (SSE)"]
         Auth["auth.py<br/>get_user_id (Bearer or anon)"]
 
-        subgraph IngestPipeline["services/ — ingestion pipeline"]
+        subgraph IngestPipeline["services - ingestion pipeline"]
             Parser["parser.py<br/>pypdf · BeautifulSoup · text"]
             Chunker["chunker.py<br/>LlamaIndex SentenceSplitter<br/>512 tokens / 128 overlap"]
             Embedder["embeddings.py<br/>HuggingFaceEmbeddingProvider<br/>all-mpnet-base-v2 · 768-d"]
             IngestOrch["ingest.py<br/>persist Document + chunks"]
         end
 
-        subgraph AgentGraph["agents/ — LangGraph orchestrator"]
-            Router["router_node<br/>(Gemini classify<br/>or pre-set force_route)"]
-            Tutor["tutor_node<br/>retrieve k=4 → strict<br/>citation system prompt"]
-            Quiz["quiz_node<br/>retrieve k=2 → structured<br/>MCQ system prompt"]
+        subgraph AgentGraph["agents - LangGraph orchestrator"]
+            Router["router_node<br/>Gemini classify<br/>or pre-set force_route"]
+            Tutor["tutor_node<br/>retrieve k=4<br/>strict citation prompt"]
+            Quiz["quiz_node<br/>retrieve k=2<br/>structured MCQ prompt"]
         end
 
         subgraph DataAccess["data access"]
@@ -41,34 +41,47 @@ flowchart TB
     end
 
     subgraph DataStores["External data stores"]
-        Postgres[("Postgres 16<br/>+ pgvector 0.8.2<br/>HNSW index<br/>vector_cosine_ops")]
-        Redis[("Redis 7<br/>chat:user:{uid}:session:{sid}:messages<br/>30-day TTL · 20-msg sliding window")]
-        Gemini["Google Gemini<br/>gemini-2.5-flash-lite<br/>(streaming via astream_events)"]
-        HFCache["~/.cache/huggingface/<br/>(420 MB model weights, local)"]
+        Postgres[("Postgres 16<br/>pgvector 0.8.2<br/>HNSW index<br/>vector_cosine_ops")]
+        Redis[("Redis 7<br/>chat:user:{uid}:session:{sid}:messages<br/>30-day TTL<br/>20-message sliding window")]
+        Gemini["Google Gemini<br/>gemini-2.5-flash-lite<br/>streaming via astream_events"]
+        HFCache["~/.cache/huggingface<br/>420 MB model weights"]
     end
 
     Landing --> Chat
     Landing --> Admin
+
     Admin -->|multipart upload| IngestRouter
     Admin -->|JSON scrape| IngestRouter
-    IngestRouter --> Parser --> Chunker --> Embedder --> IngestOrch
-    Embedder -.loads from.-> HFCache
+
+    IngestRouter --> Parser
+    Parser --> Chunker
+    Chunker --> Embedder
+    Embedder --> IngestOrch
+
+    Embedder -. loads from .-> HFCache
     IngestOrch -->|INSERT| Postgres
 
     Chat -->|fetch + ReadableStream<br/>SSE| ChatRouter
+
     ChatRouter --> Auth
-    ChatRouter --> AgentGraph
+    ChatRouter --> Router
+
     Router --> Tutor
     Router --> Quiz
+
     Tutor --> Retrieval
     Quiz --> Retrieval
+
     Retrieval -->|cosine SELECT<br/>via HNSW| Postgres
-    Tutor -.astream tokens.-> Gemini
-    Quiz -.astream tokens.-> Gemini
-    Router -.classify.-> Gemini
+
+    Tutor -. astream tokens .-> Gemini
+    Quiz -. astream tokens .-> Gemini
+    Router -. classify .-> Gemini
+
     ChatRouter -->|read/append turn| SessionStore
     SessionStore --> Redis
-    ChatRouter -->|word-by-word SSE deltas<br/>then data: [DONE]| Chat
+
+    ChatRouter -->|SSE deltas then DONE| Chat
 ```
 
 ---
