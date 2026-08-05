@@ -91,6 +91,7 @@ flowchart TB
 ```mermaid
 sequenceDiagram
     autonumber
+
     actor U as User
     participant FE as Next.js (browser)
     participant API as FastAPI /chat
@@ -102,50 +103,53 @@ sequenceDiagram
     participant Ses as SessionStore
     participant Rd as Redis
 
-    Note over U,FE: Step 0 — earlier: ingestion populated `documents` + `document_chunks` with 768-d HF embeddings.
+    Note over U,FE: Earlier ingestion populated documents and document_chunks with 768-dimensional HF embeddings.
 
-    U->>FE: types question, clicks Send
-    FE->>API: POST /chat { message, session_id?, force_route?, Authorization: Bearer <uid>? }
-    API->>API: get_user_id() → uid (or ANONYMOUS_USER_ID)
-    API->>API: session_id = supplied or uuid4()
-    API->>Ses: get_history(uid, sid) → list[ChatMessage]
+    U->>FE: Type question and click Send
+    FE->>API: POST /chat with message, session_id, force_route, Authorization Bearer uid
+    API->>API: get_user_id returns uid or ANONYMOUS_USER_ID
+    API->>API: session_id equals supplied value or uuid4
+    API->>Ses: get_history(uid, sid)
     Ses->>Rd: LRANGE chat:user:{uid}:session:{sid}:messages
-    Rd-->>Ses: history JSON entries (≤ 20)
-    Ses-->>API: ChatMessage[]
-    API-->>FE: 200 OK · X-Session-Id: {sid} · text/event-stream
+    Rd-->>Ses: History JSON entries (max 20)
+    Ses-->>API: ChatMessage history
+    API-->>FE: HTTP 200, X-Session-Id, text/event-stream
 
-    API->>G: graph.astream_events(initial_state, version="v2")
+    API->>G: graph.astream_events(initial_state, version=v2)
     G->>R: router_node(state)
-    alt force_route was supplied
-        R-->>G: pass-through (no LLM call)
+
+    alt force_route supplied
+        R-->>G: Pass through
     else classify
-        R->>R: Gemini call (temperature=0, "Reply TUTOR or QUIZ")
-        R-->>G: writes state["route"]
+        R->>R: Gemini classify, temperature 0
+        R-->>G: Write route into state
     end
 
-    alt route == "tutor"
+    alt route equals tutor
         G->>T: tutor_node(state)
-        T->>Emb: embed_batch([last_user_message])  (asyncio.to_thread on encode)
-        Emb-->>T: 768-d query vector
-        T->>PG: SELECT ... ORDER BY embedding <=> $1 LIMIT 4  (HNSW vector_cosine_ops)
-        PG-->>T: top-4 RetrievedChunks
-        T->>T: build "Use ONLY context [1..4]; cite [n]; refuse if insufficient"
-        T->>T: gemini_chat.astream([SystemMessage, *history, HumanMessage])
-        loop per Gemini token chunk
+        T->>Emb: embed_batch(last_user_message)
+        Emb-->>T: 768-dimensional query vector
+        T->>PG: SELECT ORDER BY embedding cosine distance LIMIT 4
+        PG-->>T: Top 4 retrieved chunks
+        T->>T: Build prompt using retrieved context and citations
+        T->>T: gemini_chat.astream(system, history, user)
+
+        loop Per streamed token
             T-->>G: AIMessageChunk
-            G-->>API: on_chat_model_stream event (langgraph_node="tutor")
-            API->>API: filter to tutor/quiz · accumulate response_buf
-            API-->>FE: data: {"delta": "<text>"}
+            G-->>API: on_chat_model_stream
+            API->>API: Accumulate response buffer
+            API-->>FE: SSE delta text
         end
-    else route == "quiz"
-        Note over G: same shape, k=2 retrieval, structured MCQ system prompt
+
+    else route equals quiz
+        Note over G: Same flow with top 2 retrieval and MCQ prompt
     end
 
     API->>Ses: append_turn(uid, sid, user_msg, assistant_msg)
-    Ses->>Rd: MULTI: RPUSH + LTRIM key -20 -1 + EXPIRE key 2_592_000s · EXEC
+    Ses->>Rd: RPUSH, LTRIM, EXPIRE, EXEC
     Rd-->>Ses: OK
-    API-->>FE: data: [DONE]
-    FE->>FE: render markdown via react-markdown + rehype-highlight
+    API-->>FE: SSE end of stream
+    FE->>FE: Render markdown with react-markdown and rehype-highlight
 ```
 
 ---
